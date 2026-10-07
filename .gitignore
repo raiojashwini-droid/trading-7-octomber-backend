@@ -1,0 +1,16 @@
+node_modules
+# Keep environment variables out of version control
+.env
+
+/generated/prisma
+
+# Cache files (auto-generated with timestamps)
+src/data/contracts_cache.json
+
+# Uploads & Runtime Generated Reports / Files
+uploads/
+*.csv
+*.pdf
+*.zip
+*.log
+
