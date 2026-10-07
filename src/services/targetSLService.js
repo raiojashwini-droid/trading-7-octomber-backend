@@ -105,9 +105,18 @@ const autoCloseTrade = async (trade, exitPrice, reason) => {
  * Start the monitoring service
  * Checks every 5 seconds
  */
+let isMonitoring = false;
+
 const startTargetSLMonitoring = () => {
     setInterval(() => {
-        monitorTargetSL().catch(err => console.error('[TargetSL] Service error:', err));
+        if (isMonitoring) {
+            console.warn('[TargetSL] Previous run still active; skipping this tick to prevent overlap.');
+            return;
+        }
+        isMonitoring = true;
+        monitorTargetSL()
+            .catch(err => console.error('[TargetSL] Service error:', err))
+            .finally(() => { isMonitoring = false; });
     }, 5000); // Check every 5 seconds
 
     console.log('[TargetSL] 🚀 Auto Target/SL monitoring service started (5s interval)');

@@ -7,6 +7,22 @@ const { calculateSegmentMargin } = require('../utils/segmentMargin');
 const { getUserBannedScripsStatus } = require('../utils/bannedHelper');
 const { getClientAllowedSegments, isScripSegmentAllowed } = require('../utils/segmentPermissionHelper');
 
+// Shared lot-size cache helper (populated by kiteRoutes or lazily here)
+const LOT_MAP_CACHE_TTL_MS = 10 * 60 * 1000;
+async function getLotMap() {
+    if (global.LOT_MAP_CACHE && (Date.now() - (global.LOT_MAP_CACHE_TIME || 0)) < LOT_MAP_CACHE_TTL_MS) {
+        return global.LOT_MAP_CACHE;
+    }
+    const [lotRows] = await db.execute('SELECT symbol, lot_size FROM scrip_data');
+    const map = {};
+    lotRows.forEach(r => {
+        if (r.symbol) map[r.symbol.toUpperCase()] = parseFloat(r.lot_size || 1);
+    });
+    global.LOT_MAP_CACHE = map;
+    global.LOT_MAP_CACHE_TIME = Date.now();
+    return map;
+}
+
 /**
  * Live Market Prices (Snapshot)
  */
@@ -97,13 +113,21 @@ const getClientLiveM2M = async (req, res) => {
 
         // 1. Fetch all relevant trades (Non-Deleted)
         let tradeQuery = `
-            SELECT t.*, u.username, u.full_name, u.role as user_role, u.balance, u.is_demo, u.last_reset_at, cs.config_json as user_config
+            SELECT t.*, u.username, u.full_name, u.role as user_role, u.balance, u.is_demo, u.last_reset_at
             FROM trades t
             JOIN users u ON t.user_id = u.id
             LEFT JOIN client_settings cs ON u.id = cs.user_id
             WHERE t.status != 'DELETED'
         `;
         let tradeParams = [];
+
+        // Default time-window to avoid scanning the entire trades table
+        const includeHistory = req.query.include_history === 'true' || req.query.include_history === '1';
+        const days = parseInt(req.query.days, 10) || 7;
+        if (!includeHistory && !req.query.fromDate) {
+            tradeQuery += ' AND t.entry_time >= DATE_SUB(NOW(), INTERVAL ? DAY)';
+            tradeParams.push(days);
+        }
 
         if ((role === 'SUPERADMIN' || role === 'ADMIN') && !filterUserId) {
             isBrokerList = true;
@@ -123,8 +147,13 @@ const getClientLiveM2M = async (req, res) => {
             const brokerIds = brokers.map(b => b.id);
 
             if (role === 'ADMIN') {
-                tradeQuery += ` AND (t.created_by = ? OR t.user_id = ? OR cs.broker_id = ? OR cs.broker_id IN (${brokerIds.length > 0 ? brokerIds.join(',') : '-1'}) OR t.user_id IN (${brokerIds.length > 0 ? brokerIds.join(',') : '-1'}))`;
-                tradeParams.push(userId, userId, userId);
+                if (brokerIds.length > 0) {
+                    tradeQuery += ` AND (t.created_by = ? OR t.user_id = ? OR cs.broker_id = ? OR cs.broker_id IN (?) OR t.user_id IN (?))`;
+                    tradeParams.push(userId, userId, userId, brokerIds, brokerIds);
+                } else {
+                    tradeQuery += ` AND (t.created_by = ? OR t.user_id = ? OR cs.broker_id = ?)`;
+                    tradeParams.push(userId, userId, userId);
+                }
             }
         } else if (filterUserId) {
             if (filterUserRole === 'ADMIN') {
@@ -168,15 +197,8 @@ const getClientLiveM2M = async (req, res) => {
 
         const [trades] = await db.execute(tradeQuery, tradeParams);
 
-        // --- NEW: Sync prices for all open trades found ---
-        await syncPricesForTrades(trades);
-
-        // 2. Fetch Multipliers (Lot Sizes) from scrip_data
-        const [lotRows] = await db.execute('SELECT symbol, lot_size FROM scrip_data');
-        const lotMap = {};
-        lotRows.forEach(r => {
-            lotMap[r.symbol.toUpperCase()] = parseFloat(r.lot_size || 1);
-        });
+        // 2. Fetch Multipliers (Lot Sizes) from scrip_data (cached)
+        const lotMap = await getLotMap();
 
         const { MCX_LOT_SIZES, getMcxBaseScrip } = require('../utils/symbolHelper');
 
@@ -267,19 +289,25 @@ const getClientLiveM2M = async (req, res) => {
                 };
             });
 
-            // Load hierarchy
-            const [allUsers] = await db.execute("SELECT id, role, parent_id FROM users");
-            allUsers.forEach(u => {
+            // Load hierarchy for brokers/admins only (avoid scanning 1M users)
+            const [adminBrokerUsers] = await db.execute("SELECT id, role, parent_id FROM users WHERE role IN ('SUPERADMIN', 'ADMIN', 'BROKER')");
+            adminBrokerUsers.forEach(u => {
                 userParentMap[u.id] = u.parent_id;
                 userRoleMap[u.id] = u.role;
             });
 
-            const [clientBrokerRows] = await db.execute(`
-                SELECT u.id as client_id, u.parent_id as client_parent_id, cs.broker_id as assigned_broker_id
-                FROM users u
-                LEFT JOIN client_settings cs ON u.id = cs.user_id
-                WHERE u.role = 'TRADER'
-            `);
+            // Only fetch client settings/hierarchy for users that actually have trades
+            const tradeUserIdsForHierarchy = [...new Set(trades.map(t => t.user_id).filter(Boolean))];
+            let clientBrokerRows = [];
+            if (tradeUserIdsForHierarchy.length > 0) {
+                const [rows] = await db.query(`
+                    SELECT u.id as client_id, u.parent_id as client_parent_id, cs.broker_id as assigned_broker_id
+                    FROM users u
+                    LEFT JOIN client_settings cs ON u.id = cs.user_id
+                    WHERE u.id IN (?)
+                `, [tradeUserIdsForHierarchy]);
+                clientBrokerRows = rows;
+            }
 
             clientBrokerRows.forEach(row => {
                 let brokerId = row.assigned_broker_id || row.client_parent_id;
@@ -349,6 +377,36 @@ const getClientLiveM2M = async (req, res) => {
 
         const isSingleTraderRequest = (role === 'TRADER') || (filterUserId && filterUserRole === 'TRADER');
 
+        // Pre-load user configs and precompute price lookup structures once
+        const tradeUserIds = [...new Set(trades.map(t => t.user_id).filter(Boolean))];
+        let configRows = [];
+        if (tradeUserIds.length > 0) {
+            const [cRows] = await db.query(
+                'SELECT user_id, config_json FROM client_settings WHERE user_id IN (?)',
+                [tradeUserIds]
+            );
+            configRows = cRows;
+        }
+        const configMap = {};
+        configRows.forEach(c => {
+            try { configMap[c.user_id] = JSON.parse(c.config_json || '{}'); } catch (e) { configMap[c.user_id] = {}; }
+        });
+
+        const { getWeekBoundaries, getISTDate } = require('../services/WeeklySettlementService');
+        const { week_start } = getWeekBoundaries(getISTDate());
+        const weekStartTimeMs = new Date(`${week_start} 00:00:00`).getTime();
+
+        const commodityLotService = require('../services/CommodityLotService');
+        const { calculateEquityPnL, calculateMcxPnL } = require('../utils/equityPnL');
+
+        const allPrices = marketDataService.prices || {};
+        const priceEntries = Object.entries(allPrices).map(([key, price]) => {
+            const hasPrefix = key.includes(':');
+            const prefix = hasPrefix ? key.split(':')[0].toUpperCase() : '';
+            const clean = hasPrefix ? key.split(':')[1].toUpperCase() : key.toUpperCase();
+            return { key, prefix, clean, price };
+        });
+
         trades.forEach(trade => {
             // Exclude demo trades for global aggregations / broker dashboards
             if (trade.is_demo === 1 && !isSingleTraderRequest) {
@@ -376,15 +434,8 @@ const getClientLiveM2M = async (req, res) => {
             const qty = Math.abs(trade.qty);
             const entryPrice = parseFloat(trade.entry_price || 0);
 
-            // Parse user config if available
-            let userConfig = null;
-            if (trade.user_config) {
-                try {
-                    userConfig = typeof trade.user_config === 'string' ? JSON.parse(trade.user_config) : trade.user_config;
-                } catch (e) {
-                    console.error('Failed to parse user config for P/L calculation:', e);
-                }
-            }
+            // Use pre-loaded user config
+            const userConfig = configMap[trade.user_id] || null;
 
             const lotSize = getMultiplier(trade.symbol, mType, userConfig);
 
@@ -403,12 +454,8 @@ const getClientLiveM2M = async (req, res) => {
             const tradeValue = entryPrice * totalUnits;
 
             // Scope Dashboard Turnover and Brokerage stats to Current Active Week / Last Reset Cycle (Full Timestamp Comparison)
-            const { getWeekBoundaries, getISTDate } = require('../services/WeeklySettlementService');
-            const { week_start } = getWeekBoundaries(getISTDate());
-
             const tradeTimeMs = trade.exit_time ? new Date(trade.exit_time).getTime() : (trade.entry_time ? new Date(trade.entry_time).getTime() : 0);
-            const resetTimeMs = trade.last_reset_at ? new Date(trade.last_reset_at).getTime() : new Date(`${week_start} 00:00:00`).getTime();
-            const weekStartTimeMs = new Date(`${week_start} 00:00:00`).getTime();
+            const resetTimeMs = trade.last_reset_at ? new Date(trade.last_reset_at).getTime() : weekStartTimeMs;
 
             const effectiveResetMs = Math.max(resetTimeMs, weekStartTimeMs);
             const isTradeInCurrentWeek = tradeTimeMs >= effectiveResetMs;
@@ -491,24 +538,21 @@ const getClientLiveM2M = async (req, res) => {
                     if (liveData) break;
                 }
 
-                // 🔍 Fuzzy match fallback by base symbol prefix
+                // 🔍 Fuzzy match fallback by base symbol prefix (uses precomputed priceEntries)
                 if (!liveData) {
                     const baseSym = cleanSymbol.toUpperCase().replace(/\d+.*/, '');
                     if (baseSym && baseSym.length >= 3) {
-                        const allPrices = marketDataService.prices;
-                        for (const key of Object.keys(allPrices)) {
-                            const cleanKey = key.includes(':') ? key.split(':')[1] : key;
-                            const keyPrefix = key.includes(':') ? key.split(':')[0] : '';
-                            if (cleanKey.toUpperCase().startsWith(baseSym) && (!prefix || keyPrefix.toUpperCase() === prefix.toUpperCase())) {
-                                liveData = allPrices[key];
+                        const prefixUpper = prefix.toUpperCase();
+                        for (const entry of priceEntries) {
+                            if (entry.clean.startsWith(baseSym) && (!prefixUpper || entry.prefix === prefixUpper)) {
+                                liveData = entry.price;
                                 break;
                             }
                         }
                         if (!liveData) {
-                            for (const key of Object.keys(allPrices)) {
-                                const cleanKey = key.includes(':') ? key.split(':')[1] : key;
-                                if (cleanKey.toUpperCase().startsWith(baseSym)) {
-                                    liveData = allPrices[key];
+                            for (const entry of priceEntries) {
+                                if (entry.clean.startsWith(baseSym)) {
+                                    liveData = entry.price;
                                     break;
                                 }
                             }
@@ -526,12 +570,10 @@ const getClientLiveM2M = async (req, res) => {
                     : (liveData?.ask || liveData?.ltp || baselinePrice);
 
                 let unrealizedPnl = 0;
-                const commodityLotService = require('../services/CommodityLotService');
                 if (commodityLotService.isCommodityScrip(trade.symbol, mType)) {
                     const calc = commodityLotService.calculatePnL(trade.symbol, trade.type, baselinePrice, exitPrice, qty);
                     unrealizedPnl = calc.pnlInr;
                 } else {
-                    const { calculateEquityPnL, calculateMcxPnL } = require('../utils/equityPnL');
                     const isMcxTrade = mType === 'MCX' || (trade.symbol || '').toUpperCase().startsWith('MCX:') ||
                         ['GOLD', 'SILVER', 'CRUDEOIL', 'NATURALGAS', 'COPPER', 'ZINC', 'NICKEL', 'LEAD', 'ALUMINIUM'].some(k => (trade.symbol || '').toUpperCase().includes(k));
                     if (isMcxTrade) {
@@ -865,11 +907,7 @@ const getIndices = async (req, res) => {
 const getWatchlist = async (req, res) => {
     try {
         const { hideSet, markSet } = await getUserBannedScripsStatus(req.user?.id, req.user?.role);
-        const [lotRows] = await db.execute('SELECT symbol, lot_size FROM scrip_data');
-        const lotMap = {};
-        lotRows.forEach(r => {
-            lotMap[r.symbol.toUpperCase()] = parseFloat(r.lot_size || 1);
-        });
+        const lotMap = await getLotMap();
 
         function isHidden(sym) {
             if (!sym || hideSet.size === 0) return false;

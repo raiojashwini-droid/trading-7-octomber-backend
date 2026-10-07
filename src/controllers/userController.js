@@ -4,33 +4,30 @@ const { logAction } = require('./systemController');
 const { getFromCache, saveToCache, invalidateCache } = require('../utils/cacheManager');
 const { getLotSize } = require('../utils/symbolHelper');
 const { calculateTradeBrokerage } = require('../utils/brokerageHelper');
+const { clearSegmentCache } = require('../utils/segmentPermissionHelper');
 
 const { uploadFile, deleteFile } = require('../utils/imagekit');
 
 const getUsers = async (req, res) => {
     try {
-        const { role, adminId, fromDate, toDate } = req.query;
+        const { role, adminId, fromDate, toDate, search, page, limit, paginate } = req.query;
         const currentUserId = req.user.id;
         const currentUserRole = req.user.role;
 
-        console.log(`[getUsers] User ${currentUserId} (${currentUserRole}) requesting users with role filter: ${role || 'all'}, adminId: ${adminId || 'none'}, fromDate: ${fromDate || 'none'}, toDate: ${toDate || 'none'}`);
+        const parsedLimit = limit !== undefined ? parseInt(limit, 10) : 50;
+        const parsedPage = page !== undefined ? parseInt(page, 10) : 1;
+        const effectiveLimit = Math.min(Math.max(isNaN(parsedLimit) ? 50 : parsedLimit, 1), 5000);
+        const effectiveOffset = Math.max((isNaN(parsedPage) ? 1 : parsedPage - 1) * effectiveLimit, 0);
+
+        console.log(`[getUsers] User ${currentUserId} (${currentUserRole}) requesting users: role=${role || 'all'}, page=${parsedPage}, limit=${effectiveLimit}, search=${search || 'none'}`);
 
         const { getWeekBoundaries, getISTDate } = require('../services/WeeklySettlementService');
         const { week_start } = getWeekBoundaries(getISTDate());
 
-        // Build date filter for closed trades calculation (default to Current Active Week / Last Reset Cycle)
-        let tradeDateFilter = '';
-        if (fromDate && /^\d{4}-\d{2}-\d{2}/.test(fromDate)) {
-            tradeDateFilter += ` AND COALESCE(exit_time, entry_time) >= '${fromDate} 00:00:00'`;
-        } else {
-            tradeDateFilter += ` AND COALESCE(exit_time, entry_time) >= COALESCE(u.last_reset_at, '${week_start} 00:00:00')`;
-        }
-        if (toDate && /^\d{4}-\d{2}-\d{2}/.test(toDate)) {
-            tradeDateFilter += ` AND COALESCE(exit_time, entry_time) <= '${toDate} 23:59:59'`;
-        }
-
-        // Try to get from cache first (safe: if fails, continues to DB query)
-        const cacheKey = `users_${currentUserId}_${role || 'all'}_${adminId || 'all'}_${fromDate || 'all'}_${toDate || 'all'}`;
+        // Cache key with pagination and search
+        const cacheKey = `users_${currentUserId}_${role || 'all'}_${req.query.status || 'all'}_${adminId || 'all'}_${fromDate || 'all'}_${toDate || 'all'}_${search || 'all'}_${parsedPage}_${effectiveLimit}`;
+        // Separate cache key for total count (shared across pages, longer TTL)
+        const countCacheKey = `users_count_${currentUserId}_${role || 'all'}_${req.query.status || 'all'}_${adminId || 'all'}_${fromDate || 'all'}_${toDate || 'all'}_${search || 'all'}`;
         try {
             const cachedData = await getFromCache(cacheKey);
             if (cachedData) {
@@ -40,95 +37,194 @@ const getUsers = async (req, res) => {
             console.log(`[getUsers] Cache read failed, proceeding with DB query`);
         }
 
-        let query = `
-            SELECT
-                u.*,
-                p.username as parent_username,
-                p.full_name as parent_name,
-                u.balance as ledger_balance,
-                u.credit_limit,
-                IFNULL(ud.kyc_status, 'PENDING') as kycStatus,
-                IFNULL((SELECT SUM(pnl) FROM trades WHERE user_id = u.id AND status = 'CLOSED'${tradeDateFilter}), 0.00) as gross_pl,
-                IFNULL((SELECT SUM(brokerage) FROM trades WHERE user_id = u.id AND status = 'CLOSED'${tradeDateFilter}), 0.00) as brokerage,
-                IFNULL((SELECT SUM(swap) FROM trades WHERE user_id = u.id AND status = 'CLOSED'${tradeDateFilter}), 0.00) as swap_charges,
-                IFNULL((SELECT SUM(pnl - brokerage - swap) FROM trades WHERE user_id = u.id AND status = 'CLOSED'${tradeDateFilter}), 0.00) as net_pl,
-                (SELECT COUNT(*) FROM trades WHERE user_id = u.id AND status = 'CLOSED'${tradeDateFilter}) as closed_trades_count,
-                (SELECT COUNT(*) FROM trades WHERE user_id = u.id AND status = 'OPEN') as active_trades_count,
-                cs.config_json,
-                cs.broker_id
-            FROM users u
-            LEFT JOIN users p ON u.parent_id = p.id
-            LEFT JOIN user_documents ud ON u.id = ud.user_id
-            LEFT JOIN client_settings cs ON u.id = cs.user_id
-            WHERE 1=1
-        `;
+        // ── STEP 0: Build WHERE clause and params ──
+        let whereClause = ' WHERE 1=1';
         const params = [];
 
-        // Apply hierarchy filtering based on role
-        // SUPERADMIN/ADMIN: See only clients they created (parent_id = current user id)
-        // BROKER: If viewing BROKER role, see sub-brokers (parent_id = current user id)
-        //         If viewing TRADER role, see assigned clients (broker_id = current user id)
-        // OTHERS: See only their own created clients (parent_id = current user id)
-
+        // Apply role filter
         if (role) {
-            query += ' AND u.role = ?';
+            whereClause += ' AND u.role = ?';
             params.push(role);
         }
 
+        // Apply status filter if provided
+        if (req.query.status) {
+            whereClause += ' AND u.status = ?';
+            params.push(req.query.status);
+        }
+
+        // Apply search filter across username, full_name, email
+        if (search && search.trim()) {
+            whereClause += ' AND (u.username LIKE ? OR u.full_name LIKE ? OR u.email LIKE ?)';
+            const searchPattern = `%${search.trim()}%`;
+            params.push(searchPattern, searchPattern, searchPattern);
+        }
+
+        // Apply hierarchy filtering based on role
         if (currentUserRole === 'SUPERADMIN') {
             if (role === 'BROKER' && adminId) {
                 if (adminId === 'all') {
-                    // SUPERADMIN viewing ALL brokers across all admins
                     console.log(`[getUsers] SUPERADMIN ${currentUserId} viewing ALL brokers across all admins`);
                 } else if (adminId !== 'me' && adminId !== '') {
-                    // SUPERADMIN viewing brokers under a specific Admin
                     console.log(`[getUsers] SUPERADMIN ${currentUserId} viewing brokers under Admin ID ${adminId}`);
-                    query += ' AND u.parent_id = ?';
+                    whereClause += ' AND u.parent_id = ?';
                     params.push(adminId);
                 } else {
-                    // adminId === 'me' or empty: SUPERADMIN viewing their own direct brokers
                     console.log(`[getUsers] SUPERADMIN ${currentUserId} viewing their own direct brokers`);
-                    query += ' AND u.parent_id = ?';
+                    whereClause += ' AND u.parent_id = ?';
+                    params.push(currentUserId);
+                }
+            } else if (role === 'TRADER') {
+                if (adminId && adminId !== 'all' && adminId !== 'me') {
+                    whereClause += ' AND u.parent_id = ?';
+                    params.push(adminId);
+                } else {
+                    whereClause += ' AND (u.parent_id = ? OR u.parent_id = 1 OR u.parent_id IS NULL)';
                     params.push(currentUserId);
                 }
             } else {
-                // SUPERADMIN: See only users they directly created
-                console.log(`[getUsers] SUPERADMIN ${currentUserId} viewing their own direct users`);
-                query += ' AND u.parent_id = ?';
+                whereClause += ' AND u.parent_id = ?';
                 params.push(currentUserId);
             }
         } else if (currentUserRole === 'ADMIN') {
-            // ADMIN: See users they created OR users assigned to their brokers
-            query += ' AND (u.parent_id = ? OR u.id IN (SELECT user_id FROM client_settings WHERE broker_id IN (SELECT id FROM users WHERE parent_id = ?)))';
+            whereClause += ' AND (u.parent_id = ? OR u.id IN (SELECT user_id FROM client_settings WHERE broker_id IN (SELECT id FROM users WHERE parent_id = ?)))';
             params.push(currentUserId, currentUserId);
         } else if (currentUserRole === 'BROKER') {
-            // BROKER: See users where they are the parent OR assigned broker
-            query += ' AND (u.parent_id = ? OR cs.broker_id = ?)';
+            whereClause += ' AND (u.parent_id = ? OR u.id IN (SELECT user_id FROM client_settings WHERE broker_id = ?))';
             params.push(currentUserId, currentUserId);
         } else {
-            // Default/Trader/Other: See only themselves or their direct creations
-            query += ' AND u.parent_id = ?';
+            whereClause += ' AND u.parent_id = ?';
             params.push(currentUserId);
         }
 
-        console.log(`[getUsers] Executing query with params:`, params);
-
-        const [rows] = await db.execute(query, params);
-        console.log(`[getUsers] Returned ${rows.length} users`);
-
-        // Save to cache (safe: if fails, response still sent)
+        // ── TOTAL COUNT: cached across page flips to avoid full-table scan every time ──
+        let totalRecords = 0;
         try {
-            await saveToCache(cacheKey, rows, 300); // 5 min cache
-        } catch (cacheErr) {
-            console.log(`[getUsers] Cache save failed, but data sent`);
+            const cachedTotal = await getFromCache(countCacheKey);
+            if (cachedTotal !== null && cachedTotal !== undefined) {
+                totalRecords = cachedTotal;
+                console.log(`[getUsers] COUNT cache HIT: ${totalRecords}`);
+            } else {
+                const countQuery = `SELECT COUNT(*) as total FROM users u ${whereClause}`;
+                const [countRows] = await db.execute(countQuery, params);
+                totalRecords = countRows[0]?.total || 0;
+                try { await saveToCache(countCacheKey, totalRecords, 300); } catch (_) { }
+                console.log(`[getUsers] COUNT DB: ${totalRecords}`);
+            }
+        } catch (_) {
+            const [countRows] = await db.execute(`SELECT COUNT(*) as total FROM users u ${whereClause}`, params);
+            totalRecords = countRows[0]?.total || 0;
         }
 
+        // ── OPTIMISED 3-STEP QUERY ──
+        // Previous approach: LEFT JOIN on derived trades table → full-scans ALL millions of trade rows.
+        // New approach:
+        //   Step 1 → Get 50 user IDs for this page (users table only, instant)
+        //   Step 2 → Aggregate trades WHERE user_id IN (50 IDs) — tiny targeted scan
+        //   Step 3 → Fetch full user details for those 50 IDs only
+
+        // ── STEP 1: Get paginated user IDs (users table only, no trades) ──
+        const idQuery = `SELECT u.id FROM users u ${whereClause} ORDER BY u.id DESC LIMIT ? OFFSET ?`;
+        const idParams = [...params, effectiveLimit, effectiveOffset];
+        const [idRows] = await db.execute(idQuery, idParams);
+        const pageUserIds = idRows.map(r => r.id);
+
+        console.log(`[getUsers] Step1 got ${pageUserIds.length} IDs for page ${parsedPage}`);
+
+        let rows = [];
+        if (pageUserIds.length > 0) {
+            const idPlaceholders = pageUserIds.map(() => '?').join(',');
+
+            // ── STEP 2: Aggregate trades ONLY for these 50 user IDs ──
+            let tradeClosedFilter = `status = 'CLOSED'`;
+            if (fromDate && /^\d{4}-\d{2}-\d{2}/.test(fromDate)) {
+                tradeClosedFilter += ` AND COALESCE(exit_time, entry_time) >= '${fromDate} 00:00:00'`;
+            } else {
+                tradeClosedFilter += ` AND COALESCE(exit_time, entry_time) >= '${week_start} 00:00:00'`;
+            }
+            if (toDate && /^\d{4}-\d{2}-\d{2}/.test(toDate)) {
+                tradeClosedFilter += ` AND COALESCE(exit_time, entry_time) <= '${toDate} 23:59:59'`;
+            }
+
+            const tradeAggQuery = `
+                SELECT
+                    user_id,
+                    SUM(CASE WHEN ${tradeClosedFilter} THEN pnl ELSE 0 END) as gross_pl,
+                    SUM(CASE WHEN ${tradeClosedFilter} THEN brokerage ELSE 0 END) as brokerage,
+                    SUM(CASE WHEN ${tradeClosedFilter} THEN swap ELSE 0 END) as swap_charges,
+                    SUM(CASE WHEN ${tradeClosedFilter} THEN (pnl - brokerage - swap) ELSE 0 END) as net_pl,
+                    SUM(CASE WHEN ${tradeClosedFilter} THEN 1 ELSE 0 END) as closed_trades_count,
+                    SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) as active_trades_count
+                FROM trades
+                WHERE user_id IN (${idPlaceholders})
+                  AND status IN ('CLOSED', 'OPEN')
+                GROUP BY user_id
+            `;
+            const [tradeRows] = await db.execute(tradeAggQuery, pageUserIds);
+            // Index by user_id for O(1) merge
+            const tradeStatsMap = {};
+            tradeRows.forEach(r => { tradeStatsMap[r.user_id] = r; });
+
+            // ── STEP 3: Fetch full user details for the 50 IDs (no trades) ──
+            const fullQuery = `
+                SELECT
+                    u.*,
+                    p.username as parent_username,
+                    p.full_name as parent_name,
+                    u.balance as ledger_balance,
+                    u.credit_limit,
+                    IFNULL(ud.kyc_status, 'PENDING') as kycStatus,
+                    cs.config_json,
+                    cs.broker_id
+                FROM users u
+                LEFT JOIN users p ON u.parent_id = p.id
+                LEFT JOIN user_documents ud ON u.id = ud.user_id
+                LEFT JOIN client_settings cs ON u.id = cs.user_id
+                WHERE u.id IN (${idPlaceholders})
+                ORDER BY u.id DESC
+            `;
+            const [userRows] = await db.execute(fullQuery, pageUserIds);
+
+            // Merge trade stats into user rows
+            rows = userRows.map(u => {
+                const stats = tradeStatsMap[u.id] || {};
+                return {
+                    ...u,
+                    gross_pl: parseFloat(stats.gross_pl || 0).toFixed(2),
+                    brokerage: parseFloat(stats.brokerage || 0).toFixed(2),
+                    swap_charges: parseFloat(stats.swap_charges || 0).toFixed(2),
+                    net_pl: parseFloat(stats.net_pl || 0).toFixed(2),
+                    closed_trades_count: parseInt(stats.closed_trades_count || 0),
+                    active_trades_count: parseInt(stats.active_trades_count || 0),
+                };
+            });
+        }
+
+        console.log(`[getUsers] Returned ${rows.length} users (Total: ${totalRecords})`);
+        res.setHeader('X-Total-Count', totalRecords);
+
+        // If client specifically asked for pagination or passed page param, return full pagination payload
+        if (paginate === 'true' || req.query.page !== undefined) {
+            const resultPayload = {
+                users: rows,
+                total: totalRecords,
+                page: parsedPage,
+                limit: effectiveLimit,
+                totalPages: Math.ceil(totalRecords / effectiveLimit)
+            };
+            try { await saveToCache(cacheKey, resultPayload, 120); } catch (_) { }
+            return res.json(resultPayload);
+        }
+
+        // Default: return array for backward compatibility with existing callers
+        try { await saveToCache(cacheKey, rows, 120); } catch (_) { }
         res.json(rows);
     } catch (err) {
         console.error(err);
         res.status(500).send('Server Error');
     }
 };
+
 
 const getUserProfile = async (req, res) => {
     try {
@@ -452,6 +548,8 @@ const updateClientSettings = async (req, res) => {
                 config_json = VALUES(config_json),
                 broker_id = VALUES(broker_id)
         `, sqlParams);
+
+        clearSegmentCache(req.params.id);
 
         // ─── SYNC to user_segments table for mobile app consistency ─────
         if (configObj) {
@@ -936,7 +1034,7 @@ const getWeeklyBalance = async (req, res) => {
                 'SELECT * FROM weekly_balances WHERE user_id = ? ORDER BY week_end DESC LIMIT 1',
                 [userId]
             );
-            
+
             if (latestRows.length > 0) {
                 // If there's a previous record, the opening balance for the current week is that week's closing balance
                 weeklyBalance = {

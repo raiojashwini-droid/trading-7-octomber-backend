@@ -29,6 +29,23 @@ function checkSymbolMarked(sym, markSet) {
     return false;
 }
 
+// Shared in-memory lot-size cache (refreshes every 10 minutes)
+const LOT_MAP_CACHE_TTL_MS = 10 * 60 * 1000;
+async function getLotMap() {
+    if (global.LOT_MAP_CACHE && (Date.now() - (global.LOT_MAP_CACHE_TIME || 0)) < LOT_MAP_CACHE_TTL_MS) {
+        return global.LOT_MAP_CACHE;
+    }
+    const db = require('../config/db');
+    const [lotRows] = await db.execute('SELECT symbol, lot_size FROM scrip_data');
+    const map = {};
+    lotRows.forEach(r => {
+        if (r.symbol) map[r.symbol.toUpperCase()] = parseFloat(r.lot_size || 1);
+    });
+    global.LOT_MAP_CACHE = map;
+    global.LOT_MAP_CACHE_TIME = Date.now();
+    return map;
+}
+
 const router = express.Router();
 
 const asyncHandler = (fn) => (req, res, next) => {
@@ -1286,18 +1303,8 @@ async function _buildWatchlistData(query, userId) {
     const results = await Promise.all(chunks.map(chunk => kiteService.getQuote(chunk).catch(() => ({}))));
     for (const r of results) if (r && typeof r === 'object') Object.assign(rawQuotes, r);
 
-    // Fetch lot sizes from database (cached in RAM for 10 minutes to prevent 57,782 row DB queries on every tick)
-    if (!global.LOT_MAP_CACHE || (Date.now() - (global.LOT_MAP_CACHE_TIME || 0)) > 600000) {
-        const [lotRows] = await db.execute('SELECT symbol, lot_size FROM scrip_data');
-        const map = {};
-        lotRows.forEach(r => {
-            if (r.symbol) map[r.symbol.toUpperCase()] = parseFloat(r.lot_size || 1);
-        });
-        global.LOT_MAP_CACHE = map;
-        global.LOT_MAP_CACHE_TIME = Date.now();
-        console.log(`📊 Cached ${Object.keys(map).length} lot sizes from scrip_data in RAM`);
-    }
-    const lotMap = global.LOT_MAP_CACHE;
+    // Fetch lot sizes from database (cached in RAM for 10 minutes to prevent full table scans on every request)
+    const lotMap = await getLotMap();
 
     const getLotSize = (key) => {
         const sym = key.includes(':') ? key.split(':')[1] : key;
@@ -1335,14 +1342,6 @@ async function _buildWatchlistData(query, userId) {
     const _mcxOptCnt = rows.filter(r => r.type === 'MCX_OPT').length;
     console.log(`🔍 _buildWatchlistData rows: NSE=${_nseCnt} NFO_FUT=${_nfoFutCnt} NFO_OPT=${_nfoOptCnt} MCX_FUT=${_mcxFutCnt} MCX_OPT=${_mcxOptCnt} mcxFutKeys=${mcxFutKeys.length} nfoFutKeys=${allNfoFutKeys.length}(idx=${activeIndexFutKeys.length}+stk=${nfoStockFutKeys.length}) total=${rows.length}`);
     if (mcxFutKeys.length === 0) console.log(`🔍 mcxFutByBase keys: ${Object.keys(pc.mcxFutByBase).join(', ')}`);
-
-    // ── Step 8: Push via WebSocket ──
-    const io = require('../websocket/SocketManager').getIo();
-    if (io) {
-        const wsPayload = {};
-        for (const row of rows) wsPayload[row.symbol] = row;
-        io.emit('price_update', wsPayload);
-    }
 
     return rows;
 }
@@ -1421,9 +1420,9 @@ router.get('/market/options-chain', authMiddleware, asyncHandler(async (req, res
         // Fallback: if LTP fetch fails, try the futures price
         if (!ltp) {
             try {
-                const instruments = await getInstrumentsFromCache();
-                const futContract = instruments
-                    .filter(i => i.exchange === 'NFO' && i.name === symbol && i.instrument_type === 'FUT')
+                await getInstrumentsFromCache();
+                const futContract = indexedInstruments.NFO.FUT
+                    .filter(i => i.name === symbol)
                     .sort((a, b) => new Date(a.expiry || 0) - new Date(b.expiry || 0))
                     .find(i => new Date(i.expiry) >= new Date());
 
@@ -1450,17 +1449,15 @@ router.get('/market/options-chain', authMiddleware, asyncHandler(async (req, res
             strikes.push(s);
         }
 
-        // ── 5. Find matching CE + PE instruments from cached instrument list ──
-        const instruments = await getInstrumentsFromCache();
+        // ── 5. Find matching CE + PE instruments from pre-computed index ──
+        await getInstrumentsFromCache();
 
         // Filter to only this symbol's options for the requested expiry
         // Normalize expiry formats: CSV may have "2026-04-24", "2026-04-24T00:00:00", "24-04-2026" etc.
         const requestedExpiry = new Date(expiry).toDateString(); // "Thu Apr 24 2026"
 
-        const optionInstruments = instruments.filter(i => {
-            if (i.exchange !== 'NFO') return false;
+        const optionInstruments = indexedInstruments.NFO.OPT.filter(i => {
             if (i.name !== symbol) return false;
-            if (i.instrument_type !== 'CE' && i.instrument_type !== 'PE') return false;
             // Robust expiry match — compare as Date objects
             const instrExpiry = new Date(i.expiry || 0).toDateString();
             return instrExpiry === requestedExpiry;
@@ -2039,16 +2036,12 @@ router.get('/market/search', authMiddleware, asyncHandler(async (req, res) => {
     const instruments = await getInstrumentsFromCache();
     const query = q.toUpperCase();
 
-    // Fetch lot sizes from scrip_data for script-wise dynamic values without strict matching
-    const [lotRows] = await db.execute('SELECT symbol, lot_size FROM scrip_data');
-    const scripList = lotRows.map(r => {
-        const sym = (r.symbol || '').toUpperCase().trim();
+    // Fetch lot sizes from scrip_data (cached) for script-wise dynamic values without strict matching
+    const lotMap = await getLotMap();
+    const scripList = Object.entries(lotMap).map(([symbol, lotSize]) => {
+        const sym = (symbol || '').toUpperCase().trim();
         const base = sym.replace(/\d+[A-Z]{3}\d*[CP]E$|\d+[A-Z]{3}\d*FUT$/i, '').trim();
-        return {
-            symbol: sym,
-            base: base,
-            lotSize: parseFloat(r.lot_size || 1)
-        };
+        return { symbol: sym, base, lotSize: parseFloat(lotSize || 1) };
     }).sort((a, b) => b.symbol.length - a.symbol.length);
 
     const getDynamicLotSize = (inst) => {
@@ -2194,16 +2187,12 @@ router.get('/instruments/search', authMiddleware, asyncHandler(async (req, res) 
     // BACKEND SEARCH LOGIC: Split by spaces and ensure every word is matched
     const searchTokens = q.toUpperCase().split(/\s+/).filter(t => t.length > 0);
 
-    // Fetch lot sizes from scrip_data for script-wise dynamic values without strict matching
-    const [lotRows] = await db.execute('SELECT symbol, lot_size FROM scrip_data');
-    const scripList = lotRows.map(r => {
-        const sym = (r.symbol || '').toUpperCase().trim();
+    // Fetch lot sizes from scrip_data (cached) for script-wise dynamic values without strict matching
+    const lotMap = await getLotMap();
+    const scripList = Object.entries(lotMap).map(([symbol, lotSize]) => {
+        const sym = (symbol || '').toUpperCase().trim();
         const base = sym.replace(/\d+[A-Z]{3}\d*[CP]E$|\d+[A-Z]{3}\d*FUT$/i, '').trim();
-        return {
-            symbol: sym,
-            base: base,
-            lotSize: parseFloat(r.lot_size || 1)
-        };
+        return { symbol: sym, base, lotSize: parseFloat(lotSize || 1) };
     }).sort((a, b) => b.symbol.length - a.symbol.length);
 
     const getDynamicLotSize = (inst) => {

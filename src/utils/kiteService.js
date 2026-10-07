@@ -38,6 +38,9 @@ class KiteService {
         this.accessToken = null;
         this.sessionData = null;
         this._isAutoLoggingIn = false;
+        this.quoteCache = new Map();
+        this.quoteInFlight = new Map();
+        this.QUOTE_CACHE_TTL_MS = 1000;
 
         // Load existing session if available from DB
         this.loadSession();
@@ -286,10 +289,35 @@ class KiteService {
     }
 
     async getQuote(instruments) {
-        const arr = Array.isArray(instruments) ? instruments : instruments.split(',');
+        const arr = Array.isArray(instruments) ? [...instruments] : instruments.split(',');
+        arr.sort();
+        const cacheKey = arr.join(',');
+        const now = Date.now();
+
+        const cached = this.quoteCache.get(cacheKey);
+        if (cached && (now - cached.ts) < this.QUOTE_CACHE_TTL_MS) {
+            return cached.result;
+        }
+
+        if (this.quoteInFlight.has(cacheKey)) {
+            return this.quoteInFlight.get(cacheKey);
+        }
+
+        const promise = this._fetchQuote(arr);
+        this.quoteInFlight.set(cacheKey, promise);
+        promise.finally(() => {
+            setTimeout(() => this.quoteInFlight.delete(cacheKey), this.QUOTE_CACHE_TTL_MS);
+        });
+
+        const result = await promise;
+        this.quoteCache.set(cacheKey, { ts: Date.now(), result });
+        return result;
+    }
+
+    async _fetchQuote(arr) {
         const queryMap = {};
         const kiteQuery = [];
-        
+
         arr.forEach(i => {
             const mapped = this._mapVirtualToMega(i);
             if (!queryMap[mapped]) queryMap[mapped] = [];
@@ -299,7 +327,7 @@ class KiteService {
 
         const uniqueQuery = [...new Set(kiteQuery)].join('&');
         const data = await this.makeRequest(`/quote?${uniqueQuery}`);
-        
+
         const result = {};
         for (const [mappedSym, val] of Object.entries(data)) {
             if (queryMap[mappedSym]) {

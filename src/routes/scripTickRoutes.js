@@ -24,5 +24,8 @@ router.post('/cleanup', authMiddleware, scripTickController.triggerCleanup);
 // Get total database tick records count
 router.get('/total-count', authMiddleware, scripTickController.getTotalDbCount);
 
+// Get dynamic data-driven filter options (dates, hours, minutes)
+router.get('/filter-options', authMiddleware, scripTickController.getFilterOptions);
+
 module.exports = router;
 

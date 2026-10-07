@@ -17,6 +17,23 @@ if (fs.existsSync(envPath)) {
     }
 }
 
+const isValidDatabaseUrl = (urlStr) => {
+    if (!urlStr || typeof urlStr !== 'string') return false;
+    const trimmed = urlStr.trim();
+    if (!trimmed || trimmed === 'your-db-url' || trimmed.includes('your-db')) return false;
+    try {
+        const parsed = new URL(trimmed);
+        return parsed.protocol === 'mysql:' || parsed.protocol === 'mysqls:';
+    } catch {
+        return false;
+    }
+};
+
+if (process.env.DATABASE_URL && !isValidDatabaseUrl(process.env.DATABASE_URL)) {
+    console.warn(`⚠️ DATABASE_URL is set to a placeholder or invalid URL ("${process.env.DATABASE_URL}"). Falling back to local DB configuration.`);
+    delete process.env.DATABASE_URL;
+}
+
 let pool;
 
 if (process.env.DATABASE_URL) {

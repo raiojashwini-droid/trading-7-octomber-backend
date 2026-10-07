@@ -11,8 +11,16 @@ router.get('/indices', authMiddleware, dashboardController.getIndices);
 router.get('/watchlist', authMiddleware, dashboardController.getWatchlist);
 
 // ── Get all scrips with lot sizes from DB (commodity_forex_crypto_lot_sizes + scrip_data) ──
+let scripsCache = null;
+let scripsCacheTime = 0;
+const SCRIPS_CACHE_TTL_MS = 60_000;
+
 router.get('/scrips', async (req, res) => {
     try {
+        if (scripsCache && (Date.now() - scripsCacheTime) < SCRIPS_CACHE_TTL_MS) {
+            return res.json(scripsCache);
+        }
+
         const db = require('../config/db');
         const [cflRows] = await db.execute('SELECT symbol, lot_size FROM commodity_forex_crypto_lot_sizes');
         const [scrips] = await db.execute('SELECT symbol, lot_size FROM scrip_data ORDER BY symbol');
@@ -44,6 +52,8 @@ router.get('/scrips', async (req, res) => {
             if (!scripMap[norm]) scripMap[norm] = lotVal;
         });
 
+        scripsCache = scripMap;
+        scripsCacheTime = Date.now();
         res.json(scripMap);
     } catch (err) {
         console.error('Error fetching scrips:', err);

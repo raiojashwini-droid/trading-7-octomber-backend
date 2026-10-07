@@ -79,12 +79,6 @@ const getScripList = async (req, res) => {
         `);
         mgiRows.forEach(r => r.symbol && isContractActive(r.symbol) && symbolSet.add(r.symbol));
 
-        // 3. Load logged tick history scrip IDs (only non-expired)
-        const [historyRows] = await db.execute(`
-            SELECT DISTINCT scrip_id as symbol FROM scrip_ticks_history
-        `);
-        historyRows.forEach(r => r.symbol && isContractActive(r.symbol) && symbolSet.add(r.symbol));
-
         const contractController = require('./contractController');
         await contractController.getActiveContractSymbolsSet().catch(() => {});
         const activeSet = global.ACTIVE_AUTOMATED_SYMBOLS_SET;
@@ -124,14 +118,22 @@ const getScripList = async (req, res) => {
  */
 const getTickHistory = async (req, res) => {
     try {
-        const { date, hour, minute, scripId, limit = 500, page = 1 } = req.query;
+        const { date, hour, minute, scripId, limit = 50, page = 1, cursor } = req.query;
 
         let whereClauses = [];
         let params = [];
 
         if (scripId && scripId !== 'ALL' && scripId !== 'Select Scrip') {
-            whereClauses.push('scrip_id = ?');
-            params.push(scripId);
+            const cleanScrip = String(scripId).trim();
+            if (cleanScrip) {
+                if (cleanScrip.includes('%')) {
+                    whereClauses.push('scrip_id LIKE ?');
+                    params.push(cleanScrip);
+                } else {
+                    whereClauses.push('(scrip_id = ? OR scrip_id LIKE ?)');
+                    params.push(cleanScrip, `${cleanScrip}%`);
+                }
+            }
         }
 
         if (date) {
@@ -156,32 +158,53 @@ const getTickHistory = async (req, res) => {
                 const hStr = String(hour).padStart(2, '0');
                 whereClauses.push('system_time BETWEEN ? AND ?');
                 params.push(`${dateStr} ${hStr}:00:00`, `${dateStr} ${hStr}:59:59`);
+            } else if (isMinuteValid) {
+                const mStr = String(minute).padStart(2, '0');
+                whereClauses.push('system_time BETWEEN ? AND ? AND MINUTE(system_time) = ?');
+                params.push(`${dateStr} 00:00:00`, `${dateStr} 23:59:59`, parseInt(mStr, 10));
             } else {
                 whereClauses.push('system_time BETWEEN ? AND ?');
                 params.push(`${dateStr} 00:00:00`, `${dateStr} 23:59:59`);
             }
         }
 
-        const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
-
-        const [countRows] = await db.execute(
-            `SELECT COUNT(*) as total FROM scrip_ticks_history ${whereSql}`,
-            params
-        );
-        const total = countRows[0]?.total || 0;
-
-        const parsedLimit = parseInt(limit, 10) || 500;
+        // 1. Strict Server-Side Limit Clamping (Default: 50, Min: 1, Max: 1000)
+        const rawLimit = parseInt(limit, 10);
+        const parsedLimit = Math.min(Math.max(isNaN(rawLimit) ? 50 : rawLimit, 1), 1000);
         const parsedPage = parseInt(page, 10) || 1;
-        const offset = (parsedPage - 1) * parsedLimit;
 
-        const [rows] = await db.execute(
+        // 2. Cursor Keyset Pagination Support (using unique monotonically increasing ID)
+        let dataWhereClauses = [...whereClauses];
+        let dataParams = [...params];
+        const parsedCursor = cursor ? parseInt(cursor, 10) : null;
+        let offset = 0;
+
+        if (parsedCursor && !isNaN(parsedCursor) && parsedCursor > 0) {
+            dataWhereClauses.push('id < ?');
+            dataParams.push(parsedCursor);
+        } else {
+            offset = (parsedPage - 1) * parsedLimit;
+        }
+
+        const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+        const dataWhereSql = dataWhereClauses.length > 0 ? `WHERE ${dataWhereClauses.join(' AND ')}` : '';
+
+        // 3. Ultra-Fast Parallel Query Execution (Count only when not paginating by cursor)
+        const dataPromise = db.execute(
             `SELECT id, scrip_id, exchange_time, system_time, bid, ask, high, low, ltp 
              FROM scrip_ticks_history 
-             ${whereSql} 
+             ${dataWhereSql} 
              ORDER BY id DESC 
-             LIMIT ${parsedLimit} OFFSET ${offset}`,
-            params
+             LIMIT ${parsedLimit} ${parsedCursor ? '' : `OFFSET ${offset}`}`,
+            dataParams
         );
+
+        const countPromise = parsedCursor
+            ? Promise.resolve([{ total: 0 }])
+            : db.execute(`SELECT COUNT(*) as total FROM scrip_ticks_history ${whereSql}`, params);
+
+        const [[rows], countRes] = await Promise.all([dataPromise, countPromise]);
+        const total = parsedCursor ? 0 : (countRes[0]?.[0]?.total || 0);
 
         const formattedRows = rows.map(r => ({
             id: r.id,
@@ -195,12 +218,17 @@ const getTickHistory = async (req, res) => {
             ltp: r.ltp
         }));
 
+        const nextCursor = formattedRows.length > 0 ? formattedRows[formattedRows.length - 1].id : null;
+        const hasMore = formattedRows.length === parsedLimit;
+
         return res.json({
             success: true,
             total,
             page: parsedPage,
             limit: parsedLimit,
-            items: formattedRows
+            items: formattedRows,
+            nextCursor,
+            hasMore
         });
     } catch (err) {
         console.error('[scripTickController] Error fetching tick history:', err.message);
@@ -408,16 +436,97 @@ const triggerCleanup = async (req, res) => {
     }
 };
 
+let cachedDates = null;
+let lastDatesCacheTime = 0;
+let cachedTotalDbCount = null;
+let lastTotalCountCacheTime = 0;
+const CACHE_TTL_MS = 30000;
+
 /**
  * 8. Get Total Database Row Count for scrip_ticks_history
  */
 const getTotalDbCount = async (req, res) => {
     try {
+        const now = Date.now();
+        if (cachedTotalDbCount !== null && (now - lastTotalCountCacheTime < CACHE_TTL_MS)) {
+            return res.json({ success: true, count: cachedTotalDbCount });
+        }
         const [cRows] = await db.execute("SELECT COUNT(id) as cnt FROM scrip_ticks_history");
         const count = parseInt(cRows[0]?.cnt || 0, 10);
+        cachedTotalDbCount = count;
+        lastTotalCountCacheTime = now;
         return res.json({ success: true, count });
     } catch (err) {
         console.error('[scripTickController] Error fetching total DB count:', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+};
+
+/**
+ * 9. Get Dynamic Data-Driven Filter Options (Dates, Hours for Date, Minutes for Hour)
+ */
+const getFilterOptions = async (req, res) => {
+    try {
+        const { date, hour } = req.query;
+
+        // 1. If no date provided, fetch all distinct available dates from scrip_ticks_history
+        if (!date) {
+            const now = Date.now();
+            if (cachedDates !== null && (now - lastDatesCacheTime < CACHE_TTL_MS)) {
+                return res.json({ success: true, dates: cachedDates });
+            }
+            const [dateRows] = await db.execute(`
+                SELECT DATE(system_time) as tick_date 
+                FROM scrip_ticks_history 
+                WHERE system_time IS NOT NULL 
+                GROUP BY DATE(system_time) 
+                ORDER BY tick_date DESC
+            `);
+            const dates = dateRows.map(r => {
+                if (!r.tick_date) return null;
+                const d = new Date(r.tick_date);
+                const yyyy = d.getFullYear();
+                const mm = String(d.getMonth() + 1).padStart(2, '0');
+                const dd = String(d.getDate()).padStart(2, '0');
+                return `${yyyy}-${mm}-${dd}`;
+            }).filter(Boolean);
+            cachedDates = dates;
+            lastDatesCacheTime = now;
+            return res.json({ success: true, dates });
+        }
+
+        let dateStr = date;
+        if (date.includes('/')) {
+            const parts = date.split('/');
+            if (parts.length === 3) {
+                dateStr = `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+            }
+        }
+
+        // 2. If date + hour provided, fetch available minutes for that specific hour
+        if (hour !== undefined && hour !== '' && hour !== 'ALL') {
+            const hStr = String(hour).padStart(2, '0');
+            const [minRows] = await db.execute(`
+                SELECT DISTINCT LPAD(MINUTE(system_time), 2, '0') as tick_minute 
+                FROM scrip_ticks_history 
+                WHERE system_time BETWEEN ? AND ? 
+                ORDER BY tick_minute ASC
+            `, [`${dateStr} ${hStr}:00:00`, `${dateStr} ${hStr}:59:59`]);
+            const minutes = minRows.map(r => String(r.tick_minute)).filter(Boolean);
+            return res.json({ success: true, date: dateStr, hour: hStr, minutes });
+        }
+
+        // 3. If only date provided, fetch available hours for that date
+        const [hourRows] = await db.execute(`
+            SELECT DISTINCT LPAD(HOUR(system_time), 2, '0') as tick_hour 
+            FROM scrip_ticks_history 
+            WHERE system_time BETWEEN ? AND ? 
+            ORDER BY tick_hour ASC
+        `, [`${dateStr} 00:00:00`, `${dateStr} 23:59:59`]);
+        const hours = hourRows.map(r => String(r.tick_hour)).filter(Boolean);
+        return res.json({ success: true, date: dateStr, hours });
+    } catch (err) {
+        console.error('[scripTickController] Error fetching filter options:', err.message);
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -430,6 +539,7 @@ module.exports = {
     downloadPdf,
     triggerCleanup,
     sendPdfReportAndPurge,
-    getTotalDbCount
+    getTotalDbCount,
+    getFilterOptions
 };
 

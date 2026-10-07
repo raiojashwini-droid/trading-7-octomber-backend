@@ -1,5 +1,6 @@
 const db = require('../config/db');
 const bcrypt = require('bcryptjs');
+const { clearBannedCache } = require('../utils/bannedHelper');
 
 const getBannedOrders = async (req, res) => {
     try {
@@ -105,11 +106,11 @@ const toggleBannedScrip = async (req, res) => {
     try {
         if (action === 'ban') {
             await db.execute('INSERT IGNORE INTO banned_scrips (symbol, created_by) VALUES (?, ?)', [symbol, req.user.id]);
-            res.json({ message: `${symbol} banned successfully` });
         } else {
             await db.execute('DELETE FROM banned_scrips WHERE symbol = ?', [symbol]);
-            res.json({ message: `${symbol} unbanned successfully` });
         }
+        clearBannedCache();
+        res.json({ message: `${symbol} ${action === 'ban' ? 'banned' : 'unbanned'} successfully` });
     } catch (err) {
         console.error(err);
         res.status(500).json({ message: 'Server Error' });
@@ -131,6 +132,7 @@ const bulkToggleBannedScrips = async (req, res) => {
             const placeholders = symbols.map(() => '?').join(',');
             await db.execute(`DELETE FROM banned_scrips WHERE symbol IN (${placeholders})`, symbols);
         }
+        clearBannedCache();
         res.json({ message: `Bulk ${action} successful` });
     } catch (err) {
         console.error(err);

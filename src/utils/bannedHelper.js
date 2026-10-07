@@ -1,5 +1,17 @@
 const db = require('../config/db');
 
+// Simple in-memory cache with TTL for banned scrips per user
+const bannedCache = new Map();
+const BANNED_CACHE_TTL_MS = 60_000;
+
+function getBannedCacheKey(userId, userRole) {
+    return `${userId}:${userRole}`;
+}
+
+function clearBannedCache() {
+    bannedCache.clear();
+}
+
 /**
  * Returns role-based banned scrip status sets for a user:
  * - hideSet: Set of symbols that MUST BE COMPLETELY HIDDEN for this user.
@@ -7,12 +19,18 @@ const db = require('../config/db');
  */
 async function getUserBannedScripsStatus(userId, userRole) {
     try {
+        if (!userId) {
+            return { hideSet: new Set(), markSet: new Set() };
+        }
+
+        const cacheKey = getBannedCacheKey(userId, userRole);
+        const cached = bannedCache.get(cacheKey);
+        if (cached && (Date.now() - cached.ts) < BANNED_CACHE_TTL_MS) {
+            return { hideSet: new Set(cached.hideSet), markSet: new Set(cached.markSet) };
+        }
+
         const hideSet = new Set();
         const markSet = new Set();
-
-        if (!userId) {
-            return { hideSet, markSet };
-        }
 
         // 1. Resolve hierarchy IDs (SuperAdmin IDs and Parent Admin ID)
         const [superAdminRows] = await db.execute("SELECT id FROM users WHERE role = 'SUPERADMIN'");
@@ -93,6 +111,12 @@ async function getUserBannedScripsStatus(userId, userRole) {
             }
         }
 
+        bannedCache.set(cacheKey, {
+            ts: Date.now(),
+            hideSet: Array.from(hideSet),
+            markSet: Array.from(markSet)
+        });
+
         return { hideSet, markSet };
     } catch (err) {
         console.error('[getUserBannedScripsStatus] Error:', err);
@@ -162,6 +186,7 @@ module.exports = {
     getUserBannedScripsStatus,
     isScripBannedForUser,
     checkSymbolHidden,
-    checkSymbolMarked
+    checkSymbolMarked,
+    clearBannedCache
 };
 

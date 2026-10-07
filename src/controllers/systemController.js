@@ -1,4 +1,5 @@
 const db = require('../config/db');
+const { clearSegmentCache } = require('../utils/segmentPermissionHelper');
 
 const logAction = async (userId, action, target, details) => {
     try {
@@ -231,6 +232,7 @@ const globalBatchUpdate = async (req, res) => {
                     scalping_sl_enabled = VALUES(scalping_sl_enabled)
             `, [uid, mergedJson, minProfitTime, scalpingSl]);
 
+            clearSegmentCache(uid);
             updatedCount++;
         }
 
