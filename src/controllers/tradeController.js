@@ -2035,8 +2035,7 @@ const getTrades = async (req, res) => {
         const limit = parseInt(req.query.limit, 10) || null;
         const offset = req.query.offset !== undefined ? parseInt(req.query.offset, 10) : ((page - 1) * (limit || 0));
         if (limit && limit > 0) {
-            query += ' LIMIT ? OFFSET ?';
-            params.push(limit, offset >= 0 ? offset : 0);
+            query += ` LIMIT ${limit} OFFSET ${offset >= 0 ? offset : 0}`;
         }
 
         const [rows] = await db.execute(query, params);
