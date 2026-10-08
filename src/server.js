@@ -31,6 +31,7 @@ const express = require('express');
 const http = require('http');
 const cors = require('cors');
 const compression = require('compression');
+const cookieParser = require('cookie-parser');
 const { initializeCache } = require('./utils/cacheManager');
 const socketManager = require('./websocket/SocketManager');
 const marketDataService = require('./services/MarketDataService');
@@ -97,9 +98,26 @@ app.use(compression({
     level: 6,  // Compression level (0-9, 6 is good balance)
     threshold: 1024  // Only compress responses > 1KB
 }));
+app.use(cookieParser());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(logIp); // Log IP for every authenticated request
+
+const { decryptData } = require('./utils/encryption');
+
+// Middleware to decrypt incoming request body if encrypted
+app.use((req, res, next) => {
+    if (req.body && req.body._encrypted && req.body.payload) {
+        const decryptedBody = decryptData(req.body.payload);
+        if (decryptedBody) {
+            req.body = decryptedBody;
+        }
+    }
+    next();
+});
+
+const encryptionMiddleware = require('./middleware/encryptionMiddleware');
+app.use(encryptionMiddleware);
 
 // Serve uploaded files statically
 const path = require('path');
