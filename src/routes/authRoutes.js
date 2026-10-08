@@ -10,9 +10,4 @@ router.post('/change-transaction-password', authMiddleware, updateTransactionPas
 router.post('/change-password', authMiddleware, changePassword);
 router.post('/verify-transaction-password', authMiddleware, verifyTransactionPassword);
 
-router.post('/logout', (req, res) => {
-    res.clearCookie('token');
-    res.json({ message: 'Logged out successfully' });
-});
-
 module.exports = router;

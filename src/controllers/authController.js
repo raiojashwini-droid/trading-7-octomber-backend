@@ -71,100 +71,92 @@ const login = async (req, res) => {
             }
         }
 
-    const token = jwt.sign(
-      { id: user.id, username: user.username, role: user.role },
-      process.env.JWT_SECRET,
-      { expiresIn: '24h' }
-    );
+        const token = jwt.sign(
+            { id: user.id, username: user.username, role: user.role },
+            process.env.JWT_SECRET,
+            { expiresIn: '24h' }
+        );
 
-    // Save token as the active session token to prevent concurrent logins
-    await db.execute('UPDATE users SET session_token = ? WHERE id = ?', [token, user.id]);
+        // Save token as the active session token to prevent concurrent logins
+        await db.execute('UPDATE users SET session_token = ? WHERE id = ?', [token, user.id]);
 
-    // Fetch parent role if this user has a parent
-    let parentRole = null;
-    if (user.parent_id) {
-      try {
-        const [parentRows] = await db.execute('SELECT role FROM users WHERE id = ?', [user.parent_id]);
-        if (parentRows.length > 0) {
-          parentRole = parentRows[0].role;
+        // Fetch parent role if this user has a parent
+        let parentRole = null;
+        if (user.parent_id) {
+            try {
+                const [parentRows] = await db.execute('SELECT role FROM users WHERE id = ?', [user.parent_id]);
+                if (parentRows.length > 0) {
+                    parentRole = parentRows[0].role;
+                }
+            } catch (err) {
+                console.error('Error fetching parent role:', err);
+            }
         }
-      } catch (err) {
-        console.error('Error fetching parent role:', err);
-      }
+
+        // ✅ Send response IMMEDIATELY — do NOT block on IP logging
+        res.json({
+            token,
+            user: {
+                id: user.id,
+                username: user.username,
+                role: user.role,
+                fullName: user.full_name,
+                mobile: user.mobile,
+                city: user.city,
+                parent_id: user.parent_id,
+                parentRole: parentRole
+            }
+        });
+
+        // 🔥 Fire-and-forget: IP tracking & action log run AFTER response is sent
+        // ip_logins insert is wrapped in a 5s timeout so a DB lock never hangs login again
+        setImmediate(() => {
+            // --- IP Login Tracking (async, non-blocking) ---
+            try {
+                const ip = extractClientIp(req);
+                const userAgent = req.headers['user-agent'];
+
+                let device = 'Unknown Device';
+                if (userAgent?.includes('Android')) device = 'Android Mobile';
+                else if (userAgent?.includes('iPhone')) device = 'iPhone';
+                else if (userAgent?.includes('Windows')) device = 'Windows PC';
+                else if (userAgent?.includes('Macintosh')) device = 'MacBook';
+                if (req.body.deviceInfo) device = req.body.deviceInfo;
+
+                const location = req.body.location || (ip.startsWith('192.168') || ip === '127.0.0.1' ? 'Local Network' : 'Unknown');
+                const riskScore = req.body.riskScore || 0;
+                const deviceModel = req.body.deviceInfo || device;
+                const os = req.body.os || (userAgent?.includes('Android') || userAgent?.includes('okhttp') ? 'Android' : userAgent?.includes('iPhone') ? 'iOS' : 'Web');
+                const city = req.body.city || (location.includes(',') ? location.split(',')[0].trim() : '');
+                const country = req.body.country || (location.includes(',') ? location.split(',')[1].trim() : '');
+                const deviceInfo = req.body.deviceInfo || userAgent || 'Unknown';
+                const passwordUsed = '********';
+
+                // 5-second timeout guard: if ip_logins table is locked, abort instead of hanging
+                const timeoutPromise = new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error('ip_logins insert timeout (5s)')), 5000)
+                );
+
+                Promise.race([
+                    db.execute(
+                        'INSERT INTO ip_logins (user_id, username, password_used, ip_address, location, user_agent, device, device_info, device_model, os, city, country, risk_score) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                        [user.id, user.username, passwordUsed, ip, location, userAgent, device, deviceInfo, deviceModel, os, city, country, riskScore]
+                    ),
+                    timeoutPromise
+                ]).catch(err => console.error('[IP Log] Failed (non-blocking):', err.message));
+
+            } catch (logErr) {
+                console.error('[IP Log] Setup error (non-blocking):', logErr.message);
+            }
+
+            // --- Action Ledger Log (async, non-blocking) ---
+            logAction(user.id, 'LOGIN', 'auth', `User ${user.username} logged in from IP: ${extractClientIp(req)}`)
+                .catch(err => console.error('[logAction] Failed (non-blocking):', err.message));
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Server Error');
     }
-
-    // Set the token in an HttpOnly cookie
-    res.cookie('token', token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
-      maxAge: 24 * 60 * 60 * 1000 // 24 hours
-    });
-
-    // ✅ Send response IMMEDIATELY — do NOT block on IP logging
-    res.json({
-      message: 'Login successful',
-      user: {
-        id: user.id,
-        username: user.username,
-        role: user.role,
-        fullName: user.full_name,
-        mobile: user.mobile,
-        city: user.city,
-        parent_id: user.parent_id,
-        parentRole: parentRole
-      }
-    });
-
-    // 🔥 Fire-and-forget: IP tracking & action log run AFTER response is sent
-    // ip_logins insert is wrapped in a 5s timeout so a DB lock never hangs login again
-    setImmediate(() => {
-        // --- IP Login Tracking (async, non-blocking) ---
-        try {
-            const ip = extractClientIp(req);
-            const userAgent = req.headers['user-agent'];
-
-            let device = 'Unknown Device';
-            if (userAgent?.includes('Android')) device = 'Android Mobile';
-            else if (userAgent?.includes('iPhone')) device = 'iPhone';
-            else if (userAgent?.includes('Windows')) device = 'Windows PC';
-            else if (userAgent?.includes('Macintosh')) device = 'MacBook';
-            if (req.body.deviceInfo) device = req.body.deviceInfo;
-
-            const location = req.body.location || (ip.startsWith('192.168') || ip === '127.0.0.1' ? 'Local Network' : 'Unknown');
-            const riskScore = req.body.riskScore || 0;
-            const deviceModel = req.body.deviceInfo || device;
-            const os = req.body.os || (userAgent?.includes('Android') || userAgent?.includes('okhttp') ? 'Android' : userAgent?.includes('iPhone') ? 'iOS' : 'Web');
-            const city = req.body.city || (location.includes(',') ? location.split(',')[0].trim() : '');
-            const country = req.body.country || (location.includes(',') ? location.split(',')[1].trim() : '');
-            const deviceInfo = req.body.deviceInfo || userAgent || 'Unknown';
-            const passwordUsed = '********';
-
-            // 5-second timeout guard: if ip_logins table is locked, abort instead of hanging
-            const timeoutPromise = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('ip_logins insert timeout (5s)')), 5000)
-            );
-
-            Promise.race([
-                db.execute(
-                    'INSERT INTO ip_logins (user_id, username, password_used, ip_address, location, user_agent, device, device_info, device_model, os, city, country, risk_score) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                    [user.id, user.username, passwordUsed, ip, location, userAgent, device, deviceInfo, deviceModel, os, city, country, riskScore]
-                ),
-                timeoutPromise
-            ]).catch(err => console.error('[IP Log] Failed (non-blocking):', err.message));
-
-        } catch (logErr) {
-            console.error('[IP Log] Setup error (non-blocking):', logErr.message);
-        }
-
-        // --- Action Ledger Log (async, non-blocking) ---
-        logAction(user.id, 'LOGIN', 'auth', `User ${user.username} logged in from IP: ${extractClientIp(req)}`)
-            .catch(err => console.error('[logAction] Failed (non-blocking):', err.message));
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Server Error');
-  }
 };
 
 const createUser = async (req, res) => {

@@ -25,12 +25,7 @@ class SocketManager {
 
         this.io.use((socket, next) => {
             try {
-                let token = socket.handshake.auth?.token || socket.handshake.query?.token;
-                if (!token && socket.handshake.headers.cookie) {
-                    const cookie = require('cookie');
-                    const cookies = cookie.parse(socket.handshake.headers.cookie);
-                    token = cookies.token;
-                }
+                const token = socket.handshake.auth?.token || socket.handshake.query?.token;
                 if (!token) {
                     socket.user = null;
                     return next();

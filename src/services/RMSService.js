@@ -119,7 +119,7 @@ class RMSService {
                     console.log(`[RMSService] 🔔 NOTIFY TRIGGERED for User #${user.id}: Loss=${lossPercentage.toFixed(2)}%`);
 
                     await db.execute(
-                        'INSERT INTO notifications (target_user_id, message, type) VALUES (?, ?, ?)',
+                        'INSERT INTO notifications (user_id, message, type) VALUES (?, ?, ?)',
                         [user.id, `⚠️ Account Margin Warning: Your losses have reached ${lossPercentage.toFixed(2)}% of ledger balance. Please add funds to avoid auto-square off.`, 'LOSS_WARNING']
                     );
 
