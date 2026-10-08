@@ -101,12 +101,12 @@ const createFund = async (req, res) => {
 
 const getFunds = async (req, res) => {
     try {
-        const { userId, amount, fromDate, toDate, current_week_only } = req.query;
+        const { userId, amount, fromDate, toDate, current_week_only, limit, page } = req.query;
         const role = req.user.role;
         const loggedInId = req.user.id;
 
         // Generate cache key based on filters
-        const cacheKey = `funds_${loggedInId}_${role}_${userId || 'all'}_${amount || 'all'}_${fromDate || 'all'}_${toDate || 'all'}_${current_week_only || 'false'}`;
+        const cacheKey = `funds_v2_${loggedInId}_${role}_${userId || 'all'}_${amount || 'all'}_${fromDate || 'all'}_${toDate || 'all'}_${current_week_only || 'false'}_${limit || 'default'}_${page || '1'}_${req.query.paginate || 'false'}`;
 
         // Try cache first
         try {
@@ -119,61 +119,82 @@ const getFunds = async (req, res) => {
             // Cache failed, continue to DB
         }
 
-        let query = `
-            SELECT l.*, u.username, u.full_name
-            FROM ledger l
-            JOIN users u ON l.user_id = u.id
-            WHERE 1=1
-        `;
+        let whereClause = '';
         const params = [];
 
-        // Role-based hierarchy filter
-        // SUPERADMIN/ADMIN: see only direct children's funds
-        // BROKER: see only directly assigned clients' funds
-        if (role === 'SUPERADMIN' || role === 'ADMIN') {
-            // See funds for users where they are the parent (direct children only)
-            query += ` AND l.user_id IN (
-                SELECT id FROM users WHERE parent_id = ?
-            )`;
+        // Role-based hierarchy filter:
+        // SUPERADMIN: see all funds across the system
+        // ADMIN: see direct users and users under their brokers
+        // BROKER: see only directly assigned clients
+        // TRADER: see only own funds
+        if (role === 'SUPERADMIN') {
+            // Superadmin views all funds
+        } else if (role === 'ADMIN') {
+            whereClause += ` AND (u.parent_id = ? OR u.parent_id IN (SELECT id FROM users WHERE parent_id = ?))`;
+            params.push(loggedInId, loggedInId);
+        } else if (role === 'BROKER') {
+            whereClause += ` AND u.parent_id = ?`;
             params.push(loggedInId);
         } else {
-            // BROKER — only directly assigned clients
-            query += ` AND u.parent_id = ?`;
+            whereClause += ` AND l.user_id = ?`;
             params.push(loggedInId);
         }
 
         if (userId) {
-            query += " AND (u.id = ? OR u.username LIKE ?)";
+            whereClause += " AND (u.id = ? OR u.username LIKE ?)";
             params.push(userId, `%${userId}%`);
         }
         if (amount) {
-            query += " AND l.amount = ?";
+            whereClause += " AND l.amount = ?";
             params.push(amount);
         }
         if (fromDate) {
-            query += " AND DATE(l.created_at) >= DATE(?)";
-            params.push(fromDate);
+            whereClause += " AND l.created_at >= ?";
+            params.push(fromDate.includes(' ') ? fromDate : `${fromDate} 00:00:00`);
         }
         if (toDate) {
-            query += " AND DATE(l.created_at) <= DATE(?)";
-            params.push(toDate);
+            whereClause += " AND l.created_at <= ?";
+            params.push(toDate.includes(' ') ? toDate : `${toDate} 23:59:59`);
         }
         if (current_week_only === 'true' || current_week_only === '1') {
             const { getWeekBoundaries, getISTDate } = require('../services/WeeklySettlementService');
             const boundaries = getWeekBoundaries(getISTDate());
-            query += " AND l.created_at >= ?";
+            whereClause += " AND l.created_at >= ?";
             params.push(boundaries.week_start + ' 00:00:00');
         }
 
-        query += " ORDER BY l.created_at DESC";
+        // 1. Fetch total matching records count
+        let total = 0;
+        try {
+            const countQuery = `SELECT COUNT(*) as total FROM ledger l JOIN users u ON l.user_id = u.id WHERE 1=1 ${whereClause}`;
+            const [cRows] = await db.execute(countQuery, params);
+            total = parseInt(cRows[0]?.total, 10) || 0;
+        } catch (cntErr) {
+            console.error('[getFunds] Count error:', cntErr.message);
+        }
 
-        const [rows] = await db.execute(query, params);
+        // 2. Fetch paginated records
+        const parsedLimit = limit && limit !== 'all' ? Math.max(1, parseInt(limit, 10)) : 50;
+        const parsedPage = Math.max(1, parseInt(page, 10) || 1);
+        const offset = (parsedPage - 1) * parsedLimit;
 
-        // Prepend Opening Balance record at the top of the list for the client
+        const dataQuery = `
+            SELECT l.*, u.username, u.full_name
+            FROM ledger l
+            JOIN users u ON l.user_id = u.id
+            WHERE 1=1 ${whereClause}
+            ORDER BY l.id DESC
+            LIMIT ? OFFSET ?
+        `;
+        const dataParams = [...params, parsedLimit, offset];
+
+        const [rows] = await db.execute(dataQuery, dataParams);
+
+        // Prepend Opening Balance record at the top of the list for the client if single client is queried
         if (userId) {
             try {
                 const [uRows] = await db.execute(
-                    'SELECT id, username, full_name, balance FROM users WHERE id = ? OR username = ?',
+                    'SELECT id, username, full_name, balance FROM users WHERE id = ? OR username = ? LIMIT 1',
                     [userId, userId]
                 );
                 if (uRows.length > 0) {
@@ -206,42 +227,34 @@ const getFunds = async (req, res) => {
                         created_at: `${boundaries.week_start} 00:00:00`
                     };
 
-                    rows.push(openingEntry);
-                    // Custom Sort:
-                    // 1. New DEPOSIT/WITHDRAW entries stay at the top (newest first)
-                    // 2. OPENING_BALANCE comes ABOVE WEEKLY_SETTLEMENT
-                    // 3. WEEKLY_SETTLEMENT comes BELOW OPENING_BALANCE
-                    rows.sort((a, b) => {
-                        const isOpeningA = a.type === 'OPENING_BALANCE';
-                        const isOpeningB = b.type === 'OPENING_BALANCE';
-                        const isSettleA = a.type === 'WEEKLY_SETTLEMENT' || (a.remarks || '').includes('Weekly Settlement');
-                        const isSettleB = b.type === 'WEEKLY_SETTLEMENT' || (b.remarks || '').includes('Weekly Settlement');
-
-                        if (isOpeningA && isSettleB) return -1;
-                        if (isSettleA && isOpeningB) return 1;
-
-                        const timeA = new Date(a.created_at || 0).getTime();
-                        const timeB = new Date(b.created_at || 0).getTime();
-                        return timeB - timeA;
-                    });
+                    rows.unshift(openingEntry);
                 }
             } catch (openErr) {
                 console.error('[getFunds] Error attaching opening balance:', openErr.message);
             }
         }
 
+        const isPaginated = req.query.paginate === 'true' || Boolean(req.query.page);
+        const responsePayload = isPaginated ? {
+            data: rows,
+            total,
+            page: parsedPage,
+            limit: parsedLimit,
+            totalPages: Math.ceil(total / parsedLimit)
+        } : rows;
+
         // Save to cache with 2 min TTL
         try {
             const { saveToCache } = require('../utils/cacheManager');
-            await saveToCache(cacheKey, rows, 120);
+            await saveToCache(cacheKey, responsePayload, 120);
         } catch (e) {
             // Cache save failed, but data still sent
         }
 
-        res.json(rows);
+        res.json(responsePayload);
     } catch (err) {
-        console.error(err);
-        res.status(500).send('Server Error');
+        console.error('[getFunds] Error:', err);
+        res.status(500).json({ message: 'Server Error', error: err.message });
     }
 };
 

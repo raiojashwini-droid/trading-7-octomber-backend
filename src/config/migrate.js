@@ -271,6 +271,15 @@ const runMigrations = async () => {
     await addIndex('trades', 'idx_trades_settlement', 'settlement_id');
     await addIndex('trades', 'idx_trades_cf', 'is_carried_forward');
 
+    // Equity units mode columns
+    await addColumn('trades', 'qty_input', 'DECIMAL(10, 2) DEFAULT NULL');
+    await addColumn('trades', 'actual_qty', 'DECIMAL(10, 2) DEFAULT NULL');
+    await addColumn('trades', 'lot_size_at_entry', 'INT DEFAULT 1');
+    await addColumn('trades', 'trade_mode', "VARCHAR(10) DEFAULT 'LOTS'");
+    await addColumn('trades', 'turnover', 'DECIMAL(15, 2) DEFAULT 0');
+    await addColumn('trades', 'leverage_used', 'DECIMAL(5, 2) DEFAULT 1');
+    await addColumn('trades', 'equity_units_mode', 'TINYINT(1) DEFAULT 0');
+
     await addColumn('scrip_data', 'market_type', "ENUM('MCX','NSE','NFO','EQUITY','COMEX','FOREX','CRYPTO','COMMODITY') DEFAULT 'MCX' AFTER margin_req");
     await addColumn('scrip_data', 'expiry_date', "DATE DEFAULT NULL AFTER market_type");
 
@@ -1332,6 +1341,30 @@ const runMigrations = async () => {
         }
     } catch (err) {
         console.error('⚠️ UTC → IST migration error:', err.message);
+    }
+
+    // ─── ENSURE LEDGER TABLE AND INDEXES ──────────────────────────────────
+    try {
+        await db.execute(`
+            CREATE TABLE IF NOT EXISTS ledger (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                amount DECIMAL(18,4) NOT NULL,
+                type VARCHAR(50) NOT NULL,
+                balance_after DECIMAL(18,4) NOT NULL,
+                remarks TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                KEY idx_ledger_user_id (user_id),
+                KEY idx_ledger_created_at (created_at),
+                KEY idx_ledger_type (type)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        `);
+        await addIndex('ledger', 'idx_ledger_user_id', 'user_id');
+        await addIndex('ledger', 'idx_ledger_created_at', 'created_at');
+        await addIndex('ledger', 'idx_ledger_type', 'type');
+        await addIndex('users', 'idx_users_parent_id', 'parent_id');
+    } catch (ledgerIdxErr) {
+        console.error('⚠️ Failed to verify ledger table/indexes:', ledgerIdxErr.message);
     }
 
     console.log('✅ DB migrations complete\n');

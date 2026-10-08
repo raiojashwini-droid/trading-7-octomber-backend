@@ -6,162 +6,162 @@ const { invalidateCache } = require('../utils/cacheManager');
 const { extractClientIp } = require('../utils/ipHelper');
 
 const login = async (req, res) => {
-  const username = req.body.username ? req.body.username.trim() : '';
-  const { password } = req.body;
-  console.log(`DEBUG: Login attempt for user: "${username}" with password length: ${password?.length}`);
+    const username = req.body.username ? req.body.username.trim() : '';
+    const { password } = req.body;
+    console.log(`DEBUG: Login attempt for user: "${username}" with password length: ${password?.length}`);
 
-  try {
-    const [rows] = await db.execute('SELECT * FROM users WHERE username = ?', [username]);
-    const user = rows[0];
+    try {
+        const [rows] = await db.execute('SELECT * FROM users WHERE username = ?', [username]);
+        const user = rows[0];
 
-    if (!user) {
-      console.log(`DEBUG: User not found: ${username}`);
-      return res.status(400).json({ message: 'User not found' });
-    }
+        if (!user) {
+            console.log(`DEBUG: User not found: ${username}`);
+            return res.status(400).json({ message: 'User not found' });
+        }
 
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) {
-      console.log(`DEBUG: Password mismatch for user: ${username}`);
-      return res.status(400).json({ message: 'Invalid password' });
-    }
+        const isMatch = await bcrypt.compare(password, user.password);
+        if (!isMatch) {
+            console.log(`DEBUG: Password mismatch for user: ${username}`);
+            return res.status(400).json({ message: 'Invalid password' });
+        }
 
-    // Check if account is inactive
-    if (user.status === 'Inactive') {
-      console.log(`DEBUG: Inactive account login attempt: ${username}`);
-      return res.status(403).json({ message: 'Your account is inactive. Please contact superadmin.' });
-    }
+        // Check if account is inactive
+        if (user.status === 'Inactive') {
+            console.log(`DEBUG: Inactive account login attempt: ${username}`);
+            return res.status(403).json({ message: 'Your account is inactive. Please contact superadmin.' });
+        }
 
-    // Check if account is suspended
-    if (user.status === 'Suspended') {
-      console.log(`DEBUG: Suspended account login attempt: ${username}`);
-      return res.status(403).json({ message: 'Your account is suspended. Please contact superadmin.' });
-    }
+        // Check if account is suspended
+        if (user.status === 'Suspended') {
+            console.log(`DEBUG: Suspended account login attempt: ${username}`);
+            return res.status(403).json({ message: 'Your account is suspended. Please contact superadmin.' });
+        }
 
-    // Check if it is a Mobile App login request
-    const isMobileApp = req.body.deviceInfo && req.body.deviceInfo.includes('Mobile App');
+        // Check if it is a Mobile App login request
+        const isMobileApp = req.body.deviceInfo && req.body.deviceInfo.includes('Mobile App');
 
-    // Check role restriction based on app source:
-    // 1. TRADER role cannot login on Web
-    if (user.role === 'TRADER' && !isMobileApp) {
-      console.log(`DEBUG: Trader login attempt on web blocked for user: ${username}`);
-      return res.status(403).json({ message: 'Please login to the VTKRM app for trading.' });
-    }
+        // Check role restriction based on app source:
+        // 1. TRADER role cannot login on Web
+        if (user.role === 'TRADER' && !isMobileApp) {
+            console.log(`DEBUG: Trader login attempt on web blocked for user: ${username}`);
+            return res.status(403).json({ message: 'Please login to the VTKRM app for trading.' });
+        }
 
-    // 2. Non-TRADER roles (ADMIN, BROKER, SUPERADMIN) cannot login on Mobile App
-    if (user.role !== 'TRADER' && isMobileApp) {
-      console.log(`DEBUG: Non-trader login attempt on mobile blocked for user: ${username} (Role: ${user.role})`);
-      return res.status(403).json({ message: 'Only traders are allowed to login here.' });
-    }
+        // 2. Non-TRADER roles (ADMIN, BROKER, SUPERADMIN) cannot login on Mobile App
+        if (user.role !== 'TRADER' && isMobileApp) {
+            console.log(`DEBUG: Non-trader login attempt on mobile blocked for user: ${username} (Role: ${user.role})`);
+            return res.status(403).json({ message: 'Only traders are allowed to login here.' });
+        }
 
-    // KYC check for TRADER role
-    if (user.role === 'TRADER') {
-      try {
-        const [kycRows] = await db.execute(
-          'SELECT kyc_status FROM user_documents WHERE user_id = ?',
-          [user.id]
+        // KYC check for TRADER role
+        if (user.role === 'TRADER') {
+            try {
+                const [kycRows] = await db.execute(
+                    'SELECT kyc_status FROM user_documents WHERE user_id = ?',
+                    [user.id]
+                );
+                const kycStatus = kycRows[0]?.kyc_status;
+                // Block if KYC record missing or not VERIFIED
+                if (!kycRows[0] || kycStatus !== 'VERIFIED') {
+                    return res.status(403).json({ message: 'KYC verification incomplete. Please contact your broker.' });
+                }
+            } catch (kycErr) {
+                console.error('KYC check error:', kycErr);
+                return res.status(403).json({ message: 'KYC verification incomplete. Please contact your broker.' });
+            }
+        }
+
+        const token = jwt.sign(
+            { id: user.id, username: user.username, role: user.role },
+            process.env.JWT_SECRET,
+            { expiresIn: '24h' }
         );
-        const kycStatus = kycRows[0]?.kyc_status;
-        // Block if KYC record missing or not VERIFIED
-        if (!kycRows[0] || kycStatus !== 'VERIFIED') {
-          return res.status(403).json({ message: 'KYC verification incomplete. Please contact your broker.' });
+
+        // Save token as the active session token to prevent concurrent logins
+        await db.execute('UPDATE users SET session_token = ? WHERE id = ?', [token, user.id]);
+
+        // Fetch parent role if this user has a parent
+        let parentRole = null;
+        if (user.parent_id) {
+            try {
+                const [parentRows] = await db.execute('SELECT role FROM users WHERE id = ?', [user.parent_id]);
+                if (parentRows.length > 0) {
+                    parentRole = parentRows[0].role;
+                }
+            } catch (err) {
+                console.error('Error fetching parent role:', err);
+            }
         }
-      } catch (kycErr) {
-        console.error('KYC check error:', kycErr);
-        return res.status(403).json({ message: 'KYC verification incomplete. Please contact your broker.' });
-      }
+
+        // ✅ Send response IMMEDIATELY — do NOT block on IP logging
+        res.json({
+            token,
+            user: {
+                id: user.id,
+                username: user.username,
+                role: user.role,
+                fullName: user.full_name,
+                mobile: user.mobile,
+                city: user.city,
+                parent_id: user.parent_id,
+                parentRole: parentRole
+            }
+        });
+
+        // 🔥 Fire-and-forget: IP tracking & action log run AFTER response is sent
+        // ip_logins insert is wrapped in a 5s timeout so a DB lock never hangs login again
+        setImmediate(() => {
+            // --- IP Login Tracking (async, non-blocking) ---
+            try {
+                const ip = extractClientIp(req);
+                const userAgent = req.headers['user-agent'];
+
+                let device = 'Unknown Device';
+                if (userAgent?.includes('Android')) device = 'Android Mobile';
+                else if (userAgent?.includes('iPhone')) device = 'iPhone';
+                else if (userAgent?.includes('Windows')) device = 'Windows PC';
+                else if (userAgent?.includes('Macintosh')) device = 'MacBook';
+                if (req.body.deviceInfo) device = req.body.deviceInfo;
+
+                const location = req.body.location || (ip.startsWith('192.168') || ip === '127.0.0.1' ? 'Local Network' : 'Unknown');
+                const riskScore = req.body.riskScore || 0;
+                const deviceModel = req.body.deviceInfo || device;
+                const os = req.body.os || (userAgent?.includes('Android') || userAgent?.includes('okhttp') ? 'Android' : userAgent?.includes('iPhone') ? 'iOS' : 'Web');
+                const city = req.body.city || (location.includes(',') ? location.split(',')[0].trim() : '');
+                const country = req.body.country || (location.includes(',') ? location.split(',')[1].trim() : '');
+                const deviceInfo = req.body.deviceInfo || userAgent || 'Unknown';
+                const passwordUsed = '********';
+
+                // 5-second timeout guard: if ip_logins table is locked, abort instead of hanging
+                const timeoutPromise = new Promise((_, reject) =>
+                    setTimeout(() => reject(new Error('ip_logins insert timeout (5s)')), 5000)
+                );
+
+                Promise.race([
+                    db.execute(
+                        'INSERT INTO ip_logins (user_id, username, password_used, ip_address, location, user_agent, device, device_info, device_model, os, city, country, risk_score) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                        [user.id, user.username, passwordUsed, ip, location, userAgent, device, deviceInfo, deviceModel, os, city, country, riskScore]
+                    ),
+                    timeoutPromise
+                ]).catch(err => console.error('[IP Log] Failed (non-blocking):', err.message));
+
+            } catch (logErr) {
+                console.error('[IP Log] Setup error (non-blocking):', logErr.message);
+            }
+
+            // --- Action Ledger Log (async, non-blocking) ---
+            logAction(user.id, 'LOGIN', 'auth', `User ${user.username} logged in from IP: ${extractClientIp(req)}`)
+                .catch(err => console.error('[logAction] Failed (non-blocking):', err.message));
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Server Error');
     }
-
-    const token = jwt.sign(
-      { id: user.id, username: user.username, role: user.role },
-      process.env.JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-
-    // Save token as the active session token to prevent concurrent logins
-    await db.execute('UPDATE users SET session_token = ? WHERE id = ?', [token, user.id]);
-
-    // Fetch parent role if this user has a parent
-    let parentRole = null;
-    if (user.parent_id) {
-      try {
-        const [parentRows] = await db.execute('SELECT role FROM users WHERE id = ?', [user.parent_id]);
-        if (parentRows.length > 0) {
-          parentRole = parentRows[0].role;
-        }
-      } catch (err) {
-        console.error('Error fetching parent role:', err);
-      }
-    }
-
-    // ✅ Send response IMMEDIATELY — do NOT block on IP logging
-    res.json({
-      token,
-      user: {
-        id: user.id,
-        username: user.username,
-        role: user.role,
-        fullName: user.full_name,
-        mobile: user.mobile,
-        city: user.city,
-        parent_id: user.parent_id,
-        parentRole: parentRole
-      }
-    });
-
-    // 🔥 Fire-and-forget: IP tracking & action log run AFTER response is sent
-    // ip_logins insert is wrapped in a 5s timeout so a DB lock never hangs login again
-    setImmediate(() => {
-        // --- IP Login Tracking (async, non-blocking) ---
-        try {
-            const ip = extractClientIp(req);
-            const userAgent = req.headers['user-agent'];
-
-            let device = 'Unknown Device';
-            if (userAgent?.includes('Android')) device = 'Android Mobile';
-            else if (userAgent?.includes('iPhone')) device = 'iPhone';
-            else if (userAgent?.includes('Windows')) device = 'Windows PC';
-            else if (userAgent?.includes('Macintosh')) device = 'MacBook';
-            if (req.body.deviceInfo) device = req.body.deviceInfo;
-
-            const location = req.body.location || (ip.startsWith('192.168') || ip === '127.0.0.1' ? 'Local Network' : 'Unknown');
-            const riskScore = req.body.riskScore || 0;
-            const deviceModel = req.body.deviceInfo || device;
-            const os = req.body.os || (userAgent?.includes('Android') || userAgent?.includes('okhttp') ? 'Android' : userAgent?.includes('iPhone') ? 'iOS' : 'Web');
-            const city = req.body.city || (location.includes(',') ? location.split(',')[0].trim() : '');
-            const country = req.body.country || (location.includes(',') ? location.split(',')[1].trim() : '');
-            const deviceInfo = req.body.deviceInfo || userAgent || 'Unknown';
-            const passwordUsed = '********';
-
-            // 5-second timeout guard: if ip_logins table is locked, abort instead of hanging
-            const timeoutPromise = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('ip_logins insert timeout (5s)')), 5000)
-            );
-
-            Promise.race([
-                db.execute(
-                    'INSERT INTO ip_logins (user_id, username, password_used, ip_address, location, user_agent, device, device_info, device_model, os, city, country, risk_score) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                    [user.id, user.username, passwordUsed, ip, location, userAgent, device, deviceInfo, deviceModel, os, city, country, riskScore]
-                ),
-                timeoutPromise
-            ]).catch(err => console.error('[IP Log] Failed (non-blocking):', err.message));
-
-        } catch (logErr) {
-            console.error('[IP Log] Setup error (non-blocking):', logErr.message);
-        }
-
-        // --- Action Ledger Log (async, non-blocking) ---
-        logAction(user.id, 'LOGIN', 'auth', `User ${user.username} logged in from IP: ${extractClientIp(req)}`)
-            .catch(err => console.error('[logAction] Failed (non-blocking):', err.message));
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Server Error');
-  }
 };
 
 const createUser = async (req, res) => {
     const { username, password, fullName, email, mobile, role, parentId, creditLimit, city } = req.body;
-    
+
     if (!username || username.trim() === '') {
         return res.status(400).json({ message: 'Username is required' });
     }
@@ -170,7 +170,7 @@ const createUser = async (req, res) => {
     }
 
     const creatorRole = req.user.role;
-    
+
     // Enforcement: Hierarchy Check
     // SUPERADMIN can create ADMIN, BROKER, or TRADER
     // ADMIN can create BROKER or TRADER (but not ADMIN or SUPERADMIN)
@@ -206,12 +206,12 @@ const createUser = async (req, res) => {
         // Apply Broker Limit Enforcement
         if (parentRole === 'BROKER') {
             const roleUpper = (role || 'TRADER').toUpperCase();
-            
+
             if (roleUpper === 'TRADER') {
                 // Check trading clients limit
                 const [shareRows] = await db.execute('SELECT trading_clients_limit FROM broker_shares WHERE user_id = ?', [finalParentId]);
                 const limit = shareRows[0] ? (shareRows[0].trading_clients_limit ?? 10) : 10;
-                
+
                 const [countRows] = await db.execute(`
                     SELECT COUNT(*) AS count FROM users u
                     LEFT JOIN client_settings cs ON u.id = cs.user_id
@@ -220,15 +220,15 @@ const createUser = async (req, res) => {
                 const currentCount = countRows[0].count;
 
                 if (currentCount >= limit) {
-                    return res.status(400).json({ 
-                        message: `Limit reached: You have reached the limit of ${limit} trading clients. Cannot create more.` 
+                    return res.status(400).json({
+                        message: `Limit reached: You have reached the limit of ${limit} trading clients. Cannot create more.`
                     });
                 }
             } else if (roleUpper === 'BROKER') {
                 // Check sub-brokers limit
                 const [shareRows] = await db.execute('SELECT sub_brokers_limit FROM broker_shares WHERE user_id = ?', [finalParentId]);
                 const limit = shareRows[0] ? (shareRows[0].sub_brokers_limit ?? 3) : 3;
-                
+
                 const [countRows] = await db.execute(`
                     SELECT COUNT(*) AS count FROM users 
                     WHERE role = 'BROKER' AND parent_id = ?
@@ -236,8 +236,8 @@ const createUser = async (req, res) => {
                 const currentCount = countRows[0].count;
 
                 if (currentCount >= limit) {
-                    return res.status(400).json({ 
-                        message: `Limit reached: You have reached the limit of ${limit} sub-brokers. Cannot create more.` 
+                    return res.status(400).json({
+                        message: `Limit reached: You have reached the limit of ${limit} sub-brokers. Cannot create more.`
                     });
                 }
             }
@@ -323,14 +323,14 @@ const createUser = async (req, res) => {
             await invalidateCache(`users_${creatorId}_all`);
             await invalidateCache(`users_${creatorId}_TRADER`);
             await invalidateCache(`users_${creatorId}_BROKER`);
-            
+
             // Also invalidate the explicitly assigned parent's cache if different
             if (finalParentId && finalParentId !== creatorId) {
                 await invalidateCache(`users_${finalParentId}_all`);
                 await invalidateCache(`users_${finalParentId}_TRADER`);
                 await invalidateCache(`users_${finalParentId}_BROKER`);
             }
-        } catch (e) {}
+        } catch (e) { }
 
     } catch (err) {
         if (err.code === 'ER_DUP_ENTRY') {
@@ -390,36 +390,36 @@ const verifyTransactionPassword = async (req, res) => {
 };
 
 const getMe = async (req, res) => {
-  try {
-    const [rows] = await db.execute('SELECT id, username, role, full_name, email, mobile, city, parent_id, balance, credit_limit FROM users WHERE id = ?', [req.user.id]);
-    if (rows.length === 0) return res.status(404).json({ message: 'User not found' });
-    
-    const user = rows[0];
-    
-    // Fetch parent role if applicable
-    let parentRole = null;
-    if (user.parent_id) {
-      const [pRows] = await db.execute('SELECT role FROM users WHERE id = ?', [user.parent_id]);
-      if (pRows.length > 0) parentRole = pRows[0].role;
-    }
+    try {
+        const [rows] = await db.execute('SELECT id, username, role, full_name, email, mobile, city, parent_id, balance, credit_limit FROM users WHERE id = ?', [req.user.id]);
+        if (rows.length === 0) return res.status(404).json({ message: 'User not found' });
 
-    res.json({
-      id: user.id,
-      username: user.username,
-      role: user.role,
-      fullName: user.full_name,
-      email: user.email,
-      mobile: user.mobile,
-      city: user.city,
-      parent_id: user.parent_id,
-      parentRole: parentRole,
-      balance: user.balance,
-      creditLimit: user.credit_limit
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Server Error');
-  }
+        const user = rows[0];
+
+        // Fetch parent role if applicable
+        let parentRole = null;
+        if (user.parent_id) {
+            const [pRows] = await db.execute('SELECT role FROM users WHERE id = ?', [user.parent_id]);
+            if (pRows.length > 0) parentRole = pRows[0].role;
+        }
+
+        res.json({
+            id: user.id,
+            username: user.username,
+            role: user.role,
+            fullName: user.full_name,
+            email: user.email,
+            mobile: user.mobile,
+            city: user.city,
+            parent_id: user.parent_id,
+            parentRole: parentRole,
+            balance: user.balance,
+            creditLimit: user.credit_limit
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('Server Error');
+    }
 };
 
 module.exports = { login, createUser, updateTransactionPassword, changePassword, verifyTransactionPassword, getMe };

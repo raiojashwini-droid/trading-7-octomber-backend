@@ -1919,10 +1919,10 @@ const getTrades = async (req, res) => {
                 query += " AND t.status IN ('OPEN', 'HOLD')";
             } else if (status === 'CLOSED') {
                 query += " AND t.status IN ('CLOSED', 'SETTLED')";
-                if (!req.query.fromDate && req.query.include_history !== 'true' && req.query.include_history !== '1') {
+                if (req.query.current_week_only === 'true' || req.query.current_week_only === '1') {
                     const { getWeekBoundaries, getISTDate } = require('../services/WeeklySettlementService');
                     const { week_start } = getWeekBoundaries(getISTDate());
-                    query += ` AND COALESCE(t.exit_time, t.entry_time) >= COALESCE(u.last_reset_at, '${week_start} 00:00:00')`;
+                    query += ` AND COALESCE(t.exit_time, t.entry_time) >= '${week_start} 00:00:00'`;
                 }
             } else {
                 query += ' AND t.status = ?';
@@ -2018,24 +2018,32 @@ const getTrades = async (req, res) => {
             params.push(req.query.toDate);
         }
 
-        // Calculate true total count matching filters before applying pagination
-        let trueTotalTrades = 0;
-        try {
-            const countQuery = query.replace(/^SELECT\s+[\s\S]*?\s+FROM\s+trades\s+t/i, 'SELECT COUNT(*) as total FROM trades t');
-            const [countRows] = await db.execute(countQuery, [...params]);
-            trueTotalTrades = countRows[0]?.total || 0;
-        } catch (cErr) {
-            console.warn('[getTrades] Count query fallback:', cErr.message);
-        }
-
-        query += ' ORDER BY t.id DESC';
-
         // Optional server-side pagination (backward-compatible: no params = old behavior)
         const page = parseInt(req.query.page, 10) || 1;
         const limit = parseInt(req.query.limit, 10) || null;
         const offset = req.query.offset !== undefined ? parseInt(req.query.offset, 10) : ((page - 1) * (limit || 0));
+
+        // Calculate true total count matching filters only when pagination is requested
+        let trueTotalTrades = 0;
+        if (limit && limit > 0) {
+            try {
+                const countQuery = query
+                    .replace(/^SELECT\s+[\s\S]*?\s+FROM\s+trades\s+t/i, 'SELECT COUNT(*) as total FROM trades t')
+                    .replace('LEFT JOIN users uc ON t.created_by = uc.id', '');
+                const [countRows] = await db.execute(countQuery, [...params]);
+                trueTotalTrades = countRows[0]?.total || 0;
+            } catch (cErr) {
+                console.warn('[getTrades] Count query fallback:', cErr.message);
+            }
+        }
+
+        query += ' ORDER BY t.id DESC';
+
         if (limit && limit > 0) {
             query += ` LIMIT ${limit} OFFSET ${offset >= 0 ? offset : 0}`;
+        } else if (!req.query.all) {
+            // Safe upper limit to prevent full-table scan crashes if frontend didn't specify limit
+            query += ' LIMIT 200';
         }
 
         const [rows] = await db.execute(query, params);
@@ -2208,15 +2216,17 @@ const getTrades = async (req, res) => {
                 if (req.query.fromDate) {
                     wsiQuery += ' AND DATE(wsi.created_at) >= ?';
                     wsiParams.push(req.query.fromDate);
-                } else if (req.query.include_history !== 'true' && req.query.include_history !== '1') {
+                } else if (req.query.current_week_only === 'true' || req.query.current_week_only === '1') {
                     const { getWeekBoundaries, getISTDate } = require('../services/WeeklySettlementService');
                     const { week_start } = getWeekBoundaries(getISTDate());
-                    wsiQuery += ` AND wsi.created_at >= COALESCE(u.last_reset_at, '${week_start} 00:00:00')`;
+                    wsiQuery += ` AND wsi.created_at >= '${week_start} 00:00:00'`;
                 }
                 if (req.query.toDate) {
                     wsiQuery += ' AND DATE(wsi.created_at) <= ?';
                     wsiParams.push(req.query.toDate);
                 }
+
+                wsiQuery += ' ORDER BY wsi.id DESC LIMIT 50';
 
                 const [wsiRows] = await db.execute(wsiQuery, wsiParams);
                 const wsiMapped = wsiRows.map(item => ({
@@ -2359,14 +2369,11 @@ const getGroupTrades = async (req, res) => {
                 t.type,
                 t.market_type,
                 t.qty,
-                t.actual_qty,
-                t.qty_input,
                 t.entry_price,
                 t.exit_price,
                 t.entry_time,
                 t.exit_time,
                 t.status,
-                t.is_pending,
                 t.created_by,
                 u.username,
                 u.full_name
@@ -2381,7 +2388,7 @@ const getGroupTrades = async (req, res) => {
             query += ` AND t.user_id = ?`;
             params.push(id);
         } else if (role === 'SUPERADMIN') {
-            console.log('[getGroupTrades] SUPERADMIN viewing all groups');
+            // Superadmin views all groups
         } else if (role === 'ADMIN') {
             query += ` AND (t.created_by = ? OR t.user_id IN (
                 SELECT u.id FROM users u 
@@ -2410,17 +2417,21 @@ const getGroupTrades = async (req, res) => {
             params.push(segment);
         }
 
-        // Filter by date range
+        // Filter by date range (default to last 7 days if none specified to avoid full table filesort)
         if (fromDate) {
             query += ` AND DATE(t.entry_time) >= ?`;
             params.push(fromDate);
+        } else if (!req.query.all) {
+            query += ` AND t.entry_time >= NOW() - INTERVAL 7 DAY`;
         }
+
         if (toDate) {
             query += ` AND DATE(t.entry_time) <= ?`;
             params.push(toDate);
         }
 
-        query += ` ORDER BY t.symbol ASC, t.type ASC, t.entry_time ASC`;
+        // Use indexed t.id DESC with limit to avoid large on-disk temporary tables in C:\xampp\tmp
+        query += ` ORDER BY t.id DESC LIMIT 2000`;
 
         const [rows] = await db.execute(query, params);
 
@@ -2437,13 +2448,13 @@ const getGroupTrades = async (req, res) => {
         const detectedGroups = [];
         let groupCounter = 1;
 
-        const timeWindowMs = (parseInt(timeWindow) || 30) * 1000;
-        const minUsersCount = parseInt(minUsers) || 2;
+        const timeWindowMs = (parseInt(timeWindow, 10) || 30) * 1000;
+        const minUsersCount = parseInt(minUsers, 10) || 2;
 
         for (const key in groupedByScrip) {
             const trades = groupedByScrip[key];
             // Sort trades by entry_time
-            trades.sort((a, b) => new Date(a.entry_time) - new Date(b.entry_time));
+            trades.sort((a, b) => new Date(a.entry_time || 0) - new Date(b.entry_time || 0));
 
             let currentCluster = [];
             for (const trade of trades) {
@@ -2451,7 +2462,7 @@ const getGroupTrades = async (req, res) => {
                     currentCluster.push(trade);
                 } else {
                     const lastTradeInCluster = currentCluster[currentCluster.length - 1];
-                    const timeDiff = new Date(trade.entry_time) - new Date(lastTradeInCluster.entry_time);
+                    const timeDiff = new Date(trade.entry_time || 0) - new Date(lastTradeInCluster.entry_time || 0);
                     if (timeDiff <= timeWindowMs) {
                         currentCluster.push(trade);
                     } else {
@@ -2468,21 +2479,31 @@ const getGroupTrades = async (req, res) => {
         function processCluster(cluster) {
             const uniqueUsers = [...new Set(cluster.map(t => t.user_id))];
             if (uniqueUsers.length >= minUsersCount) {
-                const firstTradeTime = new Date(Math.min(...cluster.map(t => new Date(t.entry_time))));
-                const lastTradeTime = new Date(Math.max(...cluster.map(t => new Date(t.entry_time))));
+                const entryTimestamps = cluster
+                    .map(t => new Date(t.entry_time || t.created_at || Date.now()).getTime())
+                    .filter(n => !isNaN(n));
+                const minEntryMs = entryTimestamps.length > 0 ? Math.min(...entryTimestamps) : Date.now();
+                const maxEntryMs = entryTimestamps.length > 0 ? Math.max(...entryTimestamps) : Date.now();
+                const firstTradeTime = new Date(minEntryMs);
+                const lastTradeTime = new Date(maxEntryMs);
+
                 const totalQty = cluster.reduce((sum, t) => sum + parseFloat(t.qty || 0), 0);
                 const totalLots = cluster.reduce((sum, t) => sum + parseFloat(t.qty_input != null ? t.qty_input : (t.qty || 0)), 0);
-                const avgPrice = cluster.reduce((sum, t) => sum + parseFloat(t.entry_price || 0), 0) / cluster.length;
+                const avgPrice = cluster.length > 0
+                    ? cluster.reduce((sum, t) => sum + parseFloat(t.entry_price || 0), 0) / cluster.length
+                    : 0;
 
                 // Advanced Coordinated Exit Check:
-                // Check if all users entered within entry window AND exited within exit window
                 let highlyCoordinated = false;
-                const exitTimes = cluster.map(t => t.exit_time).filter(t => t != null);
-                if (exitTimes.length === cluster.length) {
-                    const firstExitTime = new Date(Math.min(...exitTimes.map(t => new Date(t))));
-                    const lastExitTime = new Date(Math.max(...exitTimes.map(t => new Date(t))));
-                    const exitTimeDifference = Math.round((lastExitTime - firstExitTime) / 1000);
-                    if (exitTimeDifference <= (parseInt(timeWindow) || 30)) {
+                const validExitTimes = cluster
+                    .map(t => t.exit_time ? new Date(t.exit_time).getTime() : null)
+                    .filter(t => t !== null && !isNaN(t));
+
+                if (validExitTimes.length === cluster.length && cluster.length > 0) {
+                    const firstExitMs = Math.min(...validExitTimes);
+                    const lastExitMs = Math.max(...validExitTimes);
+                    const exitTimeDifference = Math.round((lastExitMs - firstExitMs) / 1000);
+                    if (exitTimeDifference <= (parseInt(timeWindow, 10) || 30)) {
                         highlyCoordinated = true;
                     }
                 }
@@ -2500,8 +2521,8 @@ const getGroupTrades = async (req, res) => {
                     totalLots,
                     firstTradeTime: firstTradeTime.toISOString(),
                     lastTradeTime: lastTradeTime.toISOString(),
-                    timeDifference: Math.round((lastTradeTime - firstTradeTime) / 1000),
-                    avgPrice: avgPrice.toFixed(2),
+                    timeDifference: Math.max(0, Math.round((maxEntryMs - minEntryMs) / 1000)),
+                    avgPrice: isNaN(avgPrice) ? '0.00' : avgPrice.toFixed(2),
                     highlyCoordinated,
                     trades: cluster
                 });
@@ -2510,8 +2531,8 @@ const getGroupTrades = async (req, res) => {
 
         res.json(detectedGroups);
     } catch (err) {
-        console.error(err);
-        res.status(500).send('Server Error');
+        console.error('Get Group Trades Error:', err);
+        res.status(500).json({ message: 'Server Error', error: err.message });
     }
 };
 

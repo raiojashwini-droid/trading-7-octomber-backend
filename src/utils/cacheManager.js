@@ -54,6 +54,13 @@ const initializeCache = async () => {
     }
 };
 
+const withTimeout = (promise, ms = 500) => {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Cache operation timed out')), ms))
+    ]);
+};
+
 /**
  * Get value from cache
  * Safe: Returns null if cache unavailable
@@ -62,7 +69,7 @@ const getFromCache = async (key) => {
     if (!isRedisConnected || !redisClient) return null;
 
     try {
-        const data = await redisClient.get(key);
+        const data = await withTimeout(redisClient.get(key), 500);
         if (data) {
             console.log(`[Cache] ✅ HIT: ${key}`);
             return JSON.parse(data);
@@ -82,7 +89,7 @@ const saveToCache = async (key, value, ttlSeconds = 300) => {
     if (!isRedisConnected || !redisClient) return false;
 
     try {
-        await redisClient.setEx(key, ttlSeconds, JSON.stringify(value));
+        await withTimeout(redisClient.setEx(key, ttlSeconds, JSON.stringify(value)), 500);
         console.log(`[Cache] 💾 SAVED: ${key} (TTL: ${ttlSeconds}s)`);
         return true;
     } catch (err) {
