@@ -124,8 +124,8 @@ const getUsers = async (req, res) => {
         //   Step 3 → Fetch full user details for those 50 IDs only
 
         // ── STEP 1: Get paginated user IDs (users table only, no trades) ──
-        const idQuery = `SELECT u.id FROM users u ${whereClause} ORDER BY u.id DESC LIMIT ? OFFSET ?`;
-        const idParams = [...params, effectiveLimit, effectiveOffset];
+        const idQuery = `SELECT u.id FROM users u ${whereClause} ORDER BY u.id DESC LIMIT ${effectiveLimit} OFFSET ${effectiveOffset}`;
+        const idParams = [...params];
         const [idRows] = await db.execute(idQuery, idParams);
         const pageUserIds = idRows.map(r => r.id);
 
