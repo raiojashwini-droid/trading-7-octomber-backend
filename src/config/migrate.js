@@ -270,6 +270,10 @@ const runMigrations = async () => {
     await addColumn('trades', 'accumulated_settled_pnl', 'DECIMAL(18,4) DEFAULT 0');
     await addIndex('trades', 'idx_trades_settlement', 'settlement_id');
     await addIndex('trades', 'idx_trades_cf', 'is_carried_forward');
+    await addIndex('trades', 'idx_trades_user_status_id', 'user_id, status, id');
+    await addIndex('trades', 'idx_trades_status_id', 'status, id');
+    await addIndex('trades', 'idx_trades_symbol', 'symbol');
+    await addIndex('trades', 'idx_trades_entry_time', 'entry_time');
 
     // Equity units mode columns
     await addColumn('trades', 'qty_input', 'DECIMAL(10, 2) DEFAULT NULL');
