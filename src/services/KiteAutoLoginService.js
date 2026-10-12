@@ -145,31 +145,38 @@ class KiteAutoLoginService {
             }
 
             const fs = require('fs');
-            let executablePath = (process.env.PUPPETEER_EXECUTABLE_PATH || '').replace(/['"]/g, '').trim() || undefined;
-            if (executablePath && !fs.existsSync(executablePath)) {
-                console.warn(`[KiteAutoLogin] Configured PUPPETEER_EXECUTABLE_PATH does not exist: "${executablePath}". Probing system paths...`);
-                executablePath = undefined;
-            }
-            if (!executablePath) {
-                const candidates = [
-                    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-                    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-                    process.env.LOCALAPPDATA ? `${process.env.LOCALAPPDATA}\\Google\\Chrome\\Application\\chrome.exe` : null,
-                    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-                    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-                    '/usr/bin/google-chrome',
-                    '/usr/bin/chromium-browser',
-                    '/usr/bin/chromium'
-                ].filter(Boolean);
-                executablePath = candidates.find(p => fs.existsSync(p)) || undefined;
-                if (executablePath) {
-                    console.log(`[KiteAutoLogin] Using detected browser executable: ${executablePath}`);
-                }
+
+            // Clean process.env if it points to a non-existent path (e.g. Windows path on Railway Linux)
+            const configuredPath = (process.env.PUPPETEER_EXECUTABLE_PATH || '').replace(/['"]/g, '').trim();
+            if (configuredPath && !fs.existsSync(configuredPath)) {
+                console.warn(`[KiteAutoLogin] PUPPETEER_EXECUTABLE_PATH does not exist on disk: "${configuredPath}". Removing from process.env.`);
+                delete process.env.PUPPETEER_EXECUTABLE_PATH;
             }
 
-            browser = await puppeteer.launch({
+            const candidates = [
+                // Linux / Railway / Docker paths
+                '/usr/bin/google-chrome',
+                '/usr/bin/google-chrome-stable',
+                '/usr/bin/chromium',
+                '/usr/bin/chromium-browser',
+                // Windows paths
+                'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+                'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+                process.env.LOCALAPPDATA ? `${process.env.LOCALAPPDATA}\\Google\\Chrome\\Application\\chrome.exe` : null,
+                'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+                'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe'
+            ].filter(Boolean);
+
+            const detectedPath = candidates.find(p => fs.existsSync(p));
+            if (detectedPath) {
+                console.log(`[KiteAutoLogin] Using detected browser executable: ${detectedPath}`);
+                process.env.PUPPETEER_EXECUTABLE_PATH = detectedPath;
+            } else {
+                delete process.env.PUPPETEER_EXECUTABLE_PATH;
+            }
+
+            const launchOptions = {
                 headless: 'new',
-                executablePath,
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
@@ -181,7 +188,13 @@ class KiteAutoLoginService {
                     '--single-process',
                     '--ignore-certificate-errors'
                 ]
-            });
+            };
+
+            if (detectedPath) {
+                launchOptions.executablePath = detectedPath;
+            }
+
+            browser = await puppeteer.launch(launchOptions);
 
             const page = await browser.newPage();
 
