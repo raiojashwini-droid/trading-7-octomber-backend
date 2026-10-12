@@ -194,7 +194,7 @@ class MarketDataService extends EventEmitter {
     //   ZERODHA (KITE) INTEGRATION
     // ══════════════════════════════════════════════════════
 
-    async init(userId) {
+    async init(userId, explicitToken = null) {
         if (this.isConnecting) return;
         this.isConnecting = true;
         try {
