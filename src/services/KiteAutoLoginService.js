@@ -109,21 +109,20 @@ class KiteAutoLoginService {
      * @returns {Promise<{success: boolean, message: string, session?: Object}>}
      */
     async autoLogin(customCreds = {}) {
-        if (this._inProgressLoginPromise) {
+        if (this._activeLoginPromise) {
             console.log('⏳ [KiteAutoLogin] Login already in progress. Reusing active session request...');
-            return this._inProgressLoginPromise;
+            return this._activeLoginPromise;
         }
 
-        this._inProgressLoginPromise = (async () => {
-            return await this._performAutoLogin(customCreds);
-        })().finally(() => {
-            this._inProgressLoginPromise = null;
-        });
-
-        return this._inProgressLoginPromise;
+        this._activeLoginPromise = this._executeAutoLogin(customCreds);
+        try {
+            return await this._activeLoginPromise;
+        } finally {
+            this._activeLoginPromise = null;
+        }
     }
 
-    async _performAutoLogin(customCreds = {}) {
+    async _executeAutoLogin(customCreds = {}) {
         const apiKey = (process.env.KITE_API_KEY || '').trim();
         const userId = customCreds.userId || (process.env.ZERODHA_USER_ID || '').trim();
         const password = customCreds.password || (process.env.ZERODHA_PASSWORD || '').trim();
@@ -167,6 +166,8 @@ class KiteAutoLoginService {
                     '--no-zygote',
                     '--disable-gpu',
                     '--single-process',
+                    '--disable-crash-reporter',
+                    '--disable-breakpad',
                     '--ignore-certificate-errors'
                 ]
             });
