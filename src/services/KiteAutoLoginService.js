@@ -269,16 +269,3 @@ class KiteAutoLoginService {
 const serviceInstance = new KiteAutoLoginService();
 serviceInstance.initScheduler();
 module.exports = serviceInstance;
-            }
-        }
-        }) ().finally(() => {
-    this._loginPromise = null;
-});
-
-return this._loginPromise;
-    }
-}
-
-const serviceInstance = new KiteAutoLoginService();
-serviceInstance.initScheduler();
-module.exports = serviceInstance;

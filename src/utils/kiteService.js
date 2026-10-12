@@ -479,7 +479,5 @@ if (data.status === 'success') {
 } else {
     throw new Error(data.message || 'Kite API request failed');
 }
-    }
-}
 
 module.exports = new KiteService();
