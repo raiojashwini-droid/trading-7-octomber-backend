@@ -458,6 +458,7 @@ class KiteService {
                     console.error('❌ Auto re-login retry failed:', autoErr.message);
                 }
             }
+            this.clearSession();
             throw new Error('Kite session expired (403). Please set a new access token.');
         }
 

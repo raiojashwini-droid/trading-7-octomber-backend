@@ -88,7 +88,7 @@ class KiteAuthService {
             let session = await kiteRepo.getSessionByUserId(userId);
             let isConnected = false;
 
-            if (session && session.saved_at) {
+            if (session && session.access_token && session.saved_at) {
                 const savedDate = getIstDateStr(session.saved_at);
                 const today = getIstDateStr();
                 if (savedDate === today) {
@@ -99,7 +99,7 @@ class KiteAuthService {
             // Fallback to latest global/platform session if per-user session is not active
             if (!isConnected) {
                 const latestSession = await kiteRepo.getLatestSession();
-                if (latestSession && latestSession.saved_at) {
+                if (latestSession && latestSession.access_token && latestSession.saved_at) {
                     const savedDate = getIstDateStr(latestSession.saved_at);
                     const today = getIstDateStr();
                     if (savedDate === today) {
@@ -109,7 +109,36 @@ class KiteAuthService {
                 }
             }
 
-            if (!isConnected || !session) return { connected: false };
+            if (!isConnected || !session || !session.access_token) return { connected: false };
+
+            // Quick live verification (cached 30 seconds to prevent hammering Kite)
+            const token = session.access_token;
+            const now = Date.now();
+            if (this._tokenValidationCache && this._tokenValidationCache.token === token && (now - this._tokenValidationCache.time) < 30000) {
+                if (!this._tokenValidationCache.valid) {
+                    return { connected: false, error: 'Token expired or rejected by Zerodha' };
+                }
+            } else {
+                try {
+                    const kite = new KiteConnect({ api_key: session.api_key || API_KEY });
+                    kite.setAccessToken(token);
+                    await kite.getProfile();
+                    this._tokenValidationCache = { token, valid: true, time: now };
+                } catch (kiteErr) {
+                    const errMsg = (kiteErr.message || '').toLowerCase();
+                    if (errMsg.includes('token') || errMsg.includes('403') || errMsg.includes('unauthorized') || errMsg.includes('forbidden') || errMsg.includes('session')) {
+                        console.warn(`[KiteAuthService] Token rejected by Zerodha: ${kiteErr.message}`);
+                        this._tokenValidationCache = { token, valid: false, time: now };
+                        // Invalidate token in DB so it doesn't report connected repeatedly
+                        if (session.user_id) {
+                            await kiteRepo.deleteSession(session.user_id).catch(() => {});
+                        }
+                        return { connected: false, error: 'Token expired or rejected by Zerodha' };
+                    }
+                    // Non-auth network glitch, do not eagerly disconnect
+                    console.warn(`[KiteAuthService] Status verification network notice: ${kiteErr.message}`);
+                }
+            }
 
             return {
                 connected: true,
