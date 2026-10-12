@@ -153,9 +153,11 @@ class SocketManager {
 
                     instrumentService.getInstrumentsBySymbols(normalizedSymbols)
                         .then((instrumentsBySymbol) => {
+                            const kiteRoutes = require('../routes/kiteRoutes');
                             normalizedSymbols.forEach((symbol) => {
                                 const instrument = instrumentsBySymbol.get(symbol);
-                                marketDataService.subscribe(symbol, instrument?.instrument_token);
+                                const token = instrument?.instrument_token || kiteRoutes.getTokenSync(symbol);
+                                marketDataService.subscribe(symbol, token);
                             });
                         })
                         .catch((e) => {

@@ -70,8 +70,19 @@ class KiteService {
                             email: data.email,
                             saved_at: data.saved_at
                         };
-                        console.log('📂 Kite session loaded from DB (today\'s IST token)');
-                        return true;
+                        console.log('📂 Kite session loaded from DB (today\'s IST token). Verifying with Zerodha API...');
+                        const isHealthy = await this.testTokenHealth();
+                        if (isHealthy) {
+                            console.log('✅ Kite session verified active with Zerodha API!');
+                            return true;
+                        } else {
+                            console.warn('⚠️ Token in DB failed active health check (expired or invalid). Resetting session in DB.');
+                            this.clearSession();
+                            try {
+                                await db.execute("UPDATE user_kite_sessions SET access_token = '' WHERE id = ?", [data.id]);
+                            } catch (_) {}
+                            return false;
+                        }
                     } else {
                         console.log('⚠️ Kite session expired in DB (old IST date). Need fresh login.');
                         this.accessToken = null;

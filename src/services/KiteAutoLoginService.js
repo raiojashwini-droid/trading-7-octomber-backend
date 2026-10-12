@@ -109,24 +109,30 @@ class KiteAutoLoginService {
      * @returns {Promise<{success: boolean, message: string, session?: Object}>}
      */
     async autoLogin(customCreds = {}) {
-        const apiKey = (process.env.KITE_API_KEY || '').trim();
-        const userId = customCreds.userId || (process.env.ZERODHA_USER_ID || '').trim();
-        const password = customCreds.password || (process.env.ZERODHA_PASSWORD || '').trim();
-        const totpSecret = customCreds.totpSecret || (process.env.ZERODHA_TOTP_SECRET || '').trim();
-
-        if (!apiKey) {
-            throw new Error('KITE_API_KEY is not set in environment');
-        }
-        if (!userId || !password || !totpSecret) {
-            throw new Error('Zerodha credentials (ZERODHA_USER_ID, ZERODHA_PASSWORD, ZERODHA_TOTP_SECRET) are missing');
+        if (this._loginPromise) {
+            console.log('[KiteAutoLogin] Auto-login already running in parallel, awaiting active execution...');
+            return this._loginPromise;
         }
 
-        console.log(`[KiteAutoLogin] Starting automated login for Zerodha User: ${userId}...`);
+        this._loginPromise = (async () => {
+            const apiKey = (process.env.KITE_API_KEY || '').trim();
+            const userId = customCreds.userId || (process.env.ZERODHA_USER_ID || '').trim();
+            const password = customCreds.password || (process.env.ZERODHA_PASSWORD || '').trim();
+            const totpSecret = customCreds.totpSecret || (process.env.ZERODHA_TOTP_SECRET || '').trim();
 
-        let browser = null;
-        let capturedRequestToken = null;
+            if (!apiKey) {
+                throw new Error('KITE_API_KEY is not set in environment');
+            }
+            if (!userId || !password || !totpSecret) {
+                throw new Error('Zerodha credentials (ZERODHA_USER_ID, ZERODHA_PASSWORD, ZERODHA_TOTP_SECRET) are missing');
+            }
 
-        try {
+            console.log(`[KiteAutoLogin] Starting automated login for Zerodha User: ${userId}...`);
+
+            let browser = null;
+            let capturedRequestToken = null;
+
+            try {
             let puppeteerModule;
             try {
                 puppeteerModule = await import('puppeteer');
@@ -288,6 +294,11 @@ class KiteAutoLoginService {
                 await browser.close().catch(() => { });
             }
         }
+        })().finally(() => {
+            this._loginPromise = null;
+        });
+
+        return this._loginPromise;
     }
 }
 

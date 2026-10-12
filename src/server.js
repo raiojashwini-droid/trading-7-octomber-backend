@@ -307,7 +307,7 @@ runMigrations()
             if (process.env.ZERODHA_USER_ID && process.env.ZERODHA_PASSWORD && process.env.ZERODHA_TOTP_SECRET) {
                 setTimeout(async () => {
                     const kiteService = require('./utils/kiteService');
-                    const sessionValid = await kiteService.ensureSessionValid();
+                    const sessionValid = await kiteService.ensureSessionValid(true);
                     if (!sessionValid && !isAutoLoggingInProgress) {
                         isAutoLoggingInProgress = true;
                         console.log('ℹ️ [Startup] Zerodha not connected on server start/restart. Attempting automated login...');
@@ -319,7 +319,7 @@ runMigrations()
                     } else {
                         console.log('✅ [Startup] Valid Zerodha session already active. Skipping startup login.');
                     }
-                }, 10000);
+                }, 2000);
             }
         } catch (cronErr) {
             console.warn('Could not initialize Zerodha auto-login IST scheduler:', cronErr.message);
