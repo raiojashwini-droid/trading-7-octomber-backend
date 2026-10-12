@@ -109,30 +109,24 @@ class KiteAutoLoginService {
      * @returns {Promise<{success: boolean, message: string, session?: Object}>}
      */
     async autoLogin(customCreds = {}) {
-        if (this._loginPromise) {
-            console.log('[KiteAutoLogin] Auto-login already running in parallel, awaiting active execution...');
-            return this._loginPromise;
+        const apiKey = (process.env.KITE_API_KEY || '').trim();
+        const userId = customCreds.userId || (process.env.ZERODHA_USER_ID || '').trim();
+        const password = customCreds.password || (process.env.ZERODHA_PASSWORD || '').trim();
+        const totpSecret = customCreds.totpSecret || (process.env.ZERODHA_TOTP_SECRET || '').trim();
+
+        if (!apiKey) {
+            throw new Error('KITE_API_KEY is not set in environment');
+        }
+        if (!userId || !password || !totpSecret) {
+            throw new Error('Zerodha credentials (ZERODHA_USER_ID, ZERODHA_PASSWORD, ZERODHA_TOTP_SECRET) are missing');
         }
 
-        this._loginPromise = (async () => {
-            const apiKey = (process.env.KITE_API_KEY || '').trim();
-            const userId = customCreds.userId || (process.env.ZERODHA_USER_ID || '').trim();
-            const password = customCreds.password || (process.env.ZERODHA_PASSWORD || '').trim();
-            const totpSecret = customCreds.totpSecret || (process.env.ZERODHA_TOTP_SECRET || '').trim();
+        console.log(`[KiteAutoLogin] Starting automated login for Zerodha User: ${userId}...`);
 
-            if (!apiKey) {
-                throw new Error('KITE_API_KEY is not set in environment');
-            }
-            if (!userId || !password || !totpSecret) {
-                throw new Error('Zerodha credentials (ZERODHA_USER_ID, ZERODHA_PASSWORD, ZERODHA_TOTP_SECRET) are missing');
-            }
+        let browser = null;
+        let capturedRequestToken = null;
 
-            console.log(`[KiteAutoLogin] Starting automated login for Zerodha User: ${userId}...`);
-
-            let browser = null;
-            let capturedRequestToken = null;
-
-            try {
+        try {
             let puppeteerModule;
             try {
                 puppeteerModule = await import('puppeteer');
@@ -144,39 +138,11 @@ class KiteAutoLoginService {
                 puppeteer = puppeteer.default;
             }
 
-            const fs = require('fs');
+            const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
 
-            // Clean process.env if it points to a non-existent path (e.g. Windows path on Railway Linux)
-            const configuredPath = (process.env.PUPPETEER_EXECUTABLE_PATH || '').replace(/['"]/g, '').trim();
-            if (configuredPath && !fs.existsSync(configuredPath)) {
-                console.warn(`[KiteAutoLogin] PUPPETEER_EXECUTABLE_PATH does not exist on disk: "${configuredPath}". Removing from process.env.`);
-                delete process.env.PUPPETEER_EXECUTABLE_PATH;
-            }
-
-            const candidates = [
-                // Linux / Railway / Docker paths
-                '/usr/bin/google-chrome',
-                '/usr/bin/google-chrome-stable',
-                '/usr/bin/chromium',
-                '/usr/bin/chromium-browser',
-                // Windows paths
-                'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-                'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-                process.env.LOCALAPPDATA ? `${process.env.LOCALAPPDATA}\\Google\\Chrome\\Application\\chrome.exe` : null,
-                'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-                'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe'
-            ].filter(Boolean);
-
-            const detectedPath = candidates.find(p => fs.existsSync(p));
-            if (detectedPath) {
-                console.log(`[KiteAutoLogin] Using detected browser executable: ${detectedPath}`);
-                process.env.PUPPETEER_EXECUTABLE_PATH = detectedPath;
-            } else {
-                delete process.env.PUPPETEER_EXECUTABLE_PATH;
-            }
-
-            const launchOptions = {
+            browser = await puppeteer.launch({
                 headless: 'new',
+                executablePath,
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
@@ -188,13 +154,7 @@ class KiteAutoLoginService {
                     '--single-process',
                     '--ignore-certificate-errors'
                 ]
-            };
-
-            if (detectedPath) {
-                launchOptions.executablePath = detectedPath;
-            }
-
-            browser = await puppeteer.launch(launchOptions);
+            });
 
             const page = await browser.newPage();
 
@@ -225,15 +185,11 @@ class KiteAutoLoginService {
             await page.goto(loginUrl, { waitUntil: 'networkidle2', timeout: 30000 });
 
             // 1. Enter User ID & Password
-            const userSelector = 'input#userid, input[type="text"]';
-            await page.waitForSelector(userSelector, { timeout: 15000 });
-            await page.focus(userSelector).catch(() => {});
-            await page.type(userSelector, userId, { delay: 30 });
+            await page.waitForSelector('input[type="text"]', { timeout: 10000 });
+            await page.type('input[type="text"]', userId, { delay: 30 });
 
-            const passSelector = 'input#password, input[type="password"]';
-            await page.waitForSelector(passSelector, { timeout: 15000 });
-            await page.focus(passSelector).catch(() => {});
-            await page.type(passSelector, password, { delay: 30 });
+            await page.waitForSelector('input[type="password"]', { timeout: 10000 });
+            await page.type('input[type="password"]', password, { delay: 30 });
 
             console.log(`[KiteAutoLogin] Submitting User ID & Password...`);
             await page.click('button[type="submit"]').catch(() => page.keyboard.press('Enter'));
@@ -246,7 +202,7 @@ class KiteAutoLoginService {
             console.log(`[KiteAutoLogin] Generated 6-digit TOTP code: ${totpCode}`);
 
             // 4. Enter TOTP directly using page.type on selector
-            const totpSelector = 'input#totp, input[autocomplete="one-time-code"], input[type="text"], input[type="number"]';
+            const totpSelector = 'input[type="text"], input[type="number"]';
             await page.waitForSelector(totpSelector, { timeout: 15000 });
             await page.focus(totpSelector).catch(() => { });
             await page.type(totpSelector, String(totpCode), { delay: 50 });
@@ -307,11 +263,19 @@ class KiteAutoLoginService {
                 await browser.close().catch(() => { });
             }
         }
-        })().finally(() => {
-            this._loginPromise = null;
-        });
+    }
+}
 
-        return this._loginPromise;
+const serviceInstance = new KiteAutoLoginService();
+serviceInstance.initScheduler();
+module.exports = serviceInstance;
+            }
+        }
+        }) ().finally(() => {
+    this._loginPromise = null;
+});
+
+return this._loginPromise;
     }
 }
 

@@ -70,19 +70,8 @@ class KiteService {
                             email: data.email,
                             saved_at: data.saved_at
                         };
-                        console.log('📂 Kite session loaded from DB (today\'s IST token). Verifying with Zerodha API...');
-                        const isHealthy = await this.testTokenHealth();
-                        if (isHealthy) {
-                            console.log('✅ Kite session verified active with Zerodha API!');
-                            return true;
-                        } else {
-                            console.warn('⚠️ Token in DB failed active health check (expired or invalid). Resetting session in DB.');
-                            this.clearSession();
-                            try {
-                                await db.execute("UPDATE user_kite_sessions SET access_token = '' WHERE id = ?", [data.id]);
-                            } catch (_) {}
-                            return false;
-                        }
+                        console.log('📂 Kite session loaded from DB (today\'s IST token)');
+                        return true;
                     } else {
                         console.log('⚠️ Kite session expired in DB (old IST date). Need fresh login.');
                         this.accessToken = null;
@@ -197,26 +186,8 @@ class KiteService {
 
     // ─── STATUS & SELF-HEALING ─────────────────────────────
 
-    async testTokenHealth() {
-        if (!this.accessToken) return false;
-        try {
-            const headers = this.createHeaders();
-            const res = await fetch(`${BASE_URL}/user/profile`, { method: 'GET', headers });
-            if (res.status === 200) return true;
-            if (res.status === 403) {
-                console.warn('⚠️ [KiteService] Saved token is expired/revoked (HTTP 403). Clearing session...');
-                this.clearSession();
-                return false;
-            }
-            return false;
-        } catch (err) {
-            console.warn('⚠️ [KiteService] Token health check error:', err.message);
-            return false;
-        }
-    }
-
-    async ensureSessionValid(forceCheck = false) {
-        if (this.accessToken && this.sessionData?.saved_at && !forceCheck) {
+    async ensureSessionValid() {
+        if (this.accessToken && this.sessionData?.saved_at) {
             const savedDate = getIstDateStr(this.sessionData.saved_at);
             const today = getIstDateStr();
             if (savedDate === today) {
@@ -226,14 +197,16 @@ class KiteService {
 
         const loaded = await this.loadSessionFromDb();
         if (loaded && this.accessToken) {
-            const isHealthy = await this.testTokenHealth();
-            if (isHealthy) return true;
+            return true;
         }
 
-        if (process.env.ZERODHA_USER_ID && process.env.ZERODHA_PASSWORD && process.env.ZERODHA_TOTP_SECRET) {
+        const { hour, minute } = getIstHourAndMinute();
+        const isPast830 = (hour > 8 || (hour === 8 && minute >= 30));
+
+        if (isPast830 && process.env.ZERODHA_USER_ID && process.env.ZERODHA_PASSWORD && process.env.ZERODHA_TOTP_SECRET) {
             if (!this._isAutoLoggingIn) {
                 this._isAutoLoggingIn = true;
-                console.log('🔄 [Self-Healing] Session invalid or expired. Triggering automated Zerodha login...');
+                console.log('🔄 [Self-Healing] Session missing post-8:30 AM IST. Auto-login triggering...');
                 try {
                     const kiteAutoLoginService = require('../services/KiteAutoLoginService');
                     await kiteAutoLoginService.autoLogin();
@@ -372,7 +345,7 @@ class KiteService {
         const arr = Array.isArray(instruments) ? instruments : instruments.split(',');
         const queryMap = {};
         const kiteQuery = [];
-        
+
         arr.forEach(i => {
             const mapped = this._mapVirtualToMega(i);
             if (!queryMap[mapped]) queryMap[mapped] = [];
@@ -382,7 +355,7 @@ class KiteService {
 
         const uniqueQuery = [...new Set(kiteQuery)].join('&');
         const data = await this.makeRequest(`/quote/ltp?${uniqueQuery}`);
-        
+
         const result = {};
         for (const [mappedSym, val] of Object.entries(data)) {
             if (queryMap[mappedSym]) {
@@ -475,7 +448,6 @@ class KiteService {
 
         // Token expired (403) — auto re-login and retry
         if (response.status === 403) {
-            this.clearSession();
             if (!isRetry && process.env.ZERODHA_USER_ID && process.env.ZERODHA_PASSWORD && process.env.ZERODHA_TOTP_SECRET) {
                 console.warn(`⚠️ [KiteService] Received 403 on ${endpoint}. Attempting automatic re-login & retry...`);
                 try {
@@ -496,6 +468,17 @@ class KiteService {
         } else {
             throw new Error(data.message || 'Kite API request failed');
         }
+    }
+}
+
+module.exports = new KiteService();
+const data = await response.json();
+
+if (data.status === 'success') {
+    return data.data;
+} else {
+    throw new Error(data.message || 'Kite API request failed');
+}
     }
 }
 

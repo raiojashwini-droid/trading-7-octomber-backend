@@ -56,14 +56,8 @@ class KiteTickerService extends EventEmitter {
 
                 if (this.subscribedTokens.length > 0) {
                     this.ticker.subscribe(this.subscribedTokens);
-                    const MAX_FULL = 200;
-                    if (this.subscribedTokens.length <= MAX_FULL) {
-                        this.ticker.setMode(this.ticker.modeFull, this.subscribedTokens);
-                    } else {
-                        this.ticker.setMode(this.ticker.modeFull, this.subscribedTokens.slice(0, MAX_FULL));
-                        this.ticker.setMode(this.ticker.modeQuote, this.subscribedTokens.slice(MAX_FULL));
-                    }
-                    console.log(`📊 Subscribed to ${this.subscribedTokens.length} instruments (Full: ${Math.min(this.subscribedTokens.length, MAX_FULL)}, Quote: ${Math.max(0, this.subscribedTokens.length - MAX_FULL)})`);
+                    this.ticker.setMode(this.ticker.modeFull, this.subscribedTokens);
+                    console.log(`📊 Subscribed to ${this.subscribedTokens.length} instruments`);
                 }
             });
 
@@ -76,10 +70,10 @@ class KiteTickerService extends EventEmitter {
                 const errMsg = err?.message || String(err);
                 if (errMsg.includes('403') || errMsg.includes('Forbidden') || errMsg.includes('expired') || errMsg.includes('Token')) {
                     console.log('⛔ Kite Ticker 403 / token expired — stopping reconnect');
-                    try { this.ticker.autoReconnect(false); } catch(e) {}
+                    try { this.ticker.autoReconnect(false); } catch (e) { }
                     this.connected = false;
                     this.fallbackToMock = true;
-                    try { this.ticker.disconnect(); } catch(e) {}
+                    try { this.ticker.disconnect(); } catch (e) { }
                     return;
                 }
                 console.error('Kite Ticker Error:', errMsg);
@@ -259,15 +253,7 @@ class KiteTickerService extends EventEmitter {
         });
         if (this.connected && this.ticker) {
             this.ticker.subscribe(tokens);
-            const MAX_FULL = 200;
-            if (this.subscribedTokens.length <= MAX_FULL) {
-                this.ticker.setMode(this.ticker.modeFull, tokens);
-            } else {
-                const fullTokens = tokens.slice(0, MAX_FULL);
-                const quoteTokens = tokens.slice(MAX_FULL);
-                if (fullTokens.length) this.ticker.setMode(this.ticker.modeFull, fullTokens);
-                if (quoteTokens.length) this.ticker.setMode(this.ticker.modeQuote, quoteTokens);
-            }
+            this.ticker.setMode(this.ticker.modeFull, tokens);
         }
         this.saveSubscriptions();
     }

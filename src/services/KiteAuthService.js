@@ -109,16 +109,7 @@ class KiteAuthService {
                 }
             }
 
-            if (!isConnected || !session || !session.access_token) return { connected: false };
-
-            const kiteService = require('../utils/kiteService');
-            if (kiteService.accessToken !== session.access_token) {
-                kiteService.accessToken = session.access_token;
-            }
-            const isHealthy = await kiteService.testTokenHealth();
-            if (!isHealthy) {
-                return { connected: false };
-            }
+            if (!isConnected || !session) return { connected: false };
 
             return {
                 connected: true,

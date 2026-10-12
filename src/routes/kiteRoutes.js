@@ -124,41 +124,10 @@ async function getInstrumentsFromCache() {
             };
 
             instruments.forEach(inst => {
-                const token = inst.instrument_token;
+                const fullKey = `${inst.exchange}:${inst.tradingsymbol}`;
+                newMap.set(fullKey, inst.instrument_token);
+
                 const ex = inst.exchange;
-                const ts = inst.tradingsymbol;
-                const fullKey = `${ex}:${ts}`;
-
-                // 1. Primary key: 'NSE:INFY', 'MCX:CRUDEOIL26MARFUT'
-                newMap.set(fullKey, token);
-
-                // 2. Bare tradingsymbol: 'INFY', 'CRUDEOIL26MARFUT'
-                if (!newMap.has(ts)) newMap.set(ts, token);
-
-                // 3. For EQ / STK: also register bare name and 'NSE:name'
-                if (inst.name && (inst.instrument_type === 'EQ' || inst.instrument_type === 'STK')) {
-                    const nameKey = `${ex}:${inst.name}`;
-                    if (!newMap.has(nameKey)) newMap.set(nameKey, token);
-                    if (!newMap.has(inst.name)) newMap.set(inst.name, token);
-                }
-
-                // 4. For Futures: register without 'FUT' suffix and with spaced expiry
-                if (inst.instrument_type === 'FUT' && ts) {
-                    const withoutFut = ts.replace(/FUT$/i, '');
-                    if (withoutFut) {
-                        newMap.set(`${ex}:${withoutFut}`, token);
-                        if (!newMap.has(withoutFut)) newMap.set(withoutFut, token);
-
-                        // Spaced variation: 'CRUDEOIL26MAR' -> 'CRUDEOIL 26MAR'
-                        const spaceMatch = withoutFut.match(/^(.*?)(\d{2}[A-Z]{3})$/);
-                        if (spaceMatch) {
-                            const spaced = `${spaceMatch[1]} ${spaceMatch[2]}`;
-                            newMap.set(`${ex}:${spaced}`, token);
-                            if (!newMap.has(spaced)) newMap.set(spaced, token);
-                        }
-                    }
-                }
-
                 const type = inst.instrument_type;
                 if (newIndex[ex]) {
                     if (type === 'EQ' || type === 'STK') {
@@ -176,7 +145,7 @@ async function getInstrumentsFromCache() {
             instrumentsCache = instruments;
             instrumentsCacheTime = now;
 
-            console.log(`✅ Indexed ${instruments.length} instruments (Total symbol aliases: ${newMap.size})`);
+            console.log(`✅ Indexed ${instruments.length} instruments`);
             return instruments;
         } catch (err) {
             console.error('❌ Failed to fetch/index instruments:', err.message);
@@ -190,39 +159,7 @@ async function getInstrumentsFromCache() {
 }
 
 function getTokenSync(symbol) {
-    if (!symbol) return null;
-    const s = String(symbol).trim().toUpperCase();
-
-    // 1. Direct hit in map
-    let token = symbolTokenMap.get(s);
-    if (token) return token;
-
-    // 2. Space-collapsed hit
-    const noSpace = s.replace(/\s+/g, '');
-    token = symbolTokenMap.get(noSpace);
-    if (token) return token;
-
-    // 3. Fallback with exchange prefixes
-    if (!s.includes(':')) {
-        token = symbolTokenMap.get(`NSE:${s}`) ||
-                symbolTokenMap.get(`MCX:${s}`) ||
-                symbolTokenMap.get(`NFO:${s}`) ||
-                symbolTokenMap.get(`NSE:${noSpace}`) ||
-                symbolTokenMap.get(`MCX:${noSpace}`) ||
-                symbolTokenMap.get(`NFO:${noSpace}`) ||
-                symbolTokenMap.get(`MCX:${noSpace}FUT`) ||
-                symbolTokenMap.get(`NFO:${noSpace}FUT`) ||
-                symbolTokenMap.get(`${noSpace}FUT`);
-        if (token) return token;
-    } else {
-        const [prefix, raw] = s.split(':');
-        const cleanRaw = raw.replace(/\s+/g, '');
-        token = symbolTokenMap.get(`${prefix}:${cleanRaw}`) ||
-                symbolTokenMap.get(`${prefix}:${cleanRaw}FUT`);
-        if (token) return token;
-    }
-
-    return null;
+    return symbolTokenMap.get(symbol);
 }
 
 // ── NIFTY 50 (50 stocks — Apr 2026 official list, Zerodha exact symbols) ──
@@ -405,21 +342,18 @@ function formatQuotes(rawQuotes) {
     const formatted = {};
     for (const [symbol, quote] of Object.entries(rawQuotes)) {
         try {
-            const ltpVal = quote.last_price || quote.ltp || 0;
-            const buy0 = quote.depth?.buy?.[0]?.price;
-            const sell0 = quote.depth?.sell?.[0]?.price;
             formatted[symbol] = {
                 symbol: symbol,
-                ltp: ltpVal,
+                ltp: quote.last_price,
                 vol: quote.volume || 0,
                 oi: quote.oi || 0,
-                chg: quote.net_change || quote.change || 0,
+                chg: quote.net_change || 0,
                 open: quote.ohlc?.open || 0,
                 high: quote.ohlc?.high || 0,
                 low: quote.ohlc?.low || 0,
                 close: quote.ohlc?.close || 0,
-                bid: (buy0 != null && buy0 > 0) ? buy0 : (quote.bid && quote.bid > 0 ? quote.bid : ltpVal),
-                ask: (sell0 != null && sell0 > 0) ? sell0 : (quote.ask && quote.ask > 0 ? quote.ask : ltpVal),
+                bid: quote.depth?.buy?.[0]?.price || 0,
+                ask: quote.depth?.sell?.[0]?.price || 0,
                 time: quote.timestamp || "1970-01-01 05:30:00"
             };
         } catch (e) { }
@@ -449,11 +383,9 @@ function toYmd(dateLike) {
 }
 
 function buildUnifiedRow({ type, symbol, strike, optionType, expiry, quote, lotSize }) {
-    const ltp = quote?.last_price || quote?.ltp || 0;
+    const ltp = quote?.last_price || 0;
     const close = quote?.ohlc?.close || 0;
     const chgPct = close ? Number((((ltp - close) / close) * 100).toFixed(2)) : 0;
-    const buy0 = quote?.depth?.buy?.[0]?.price;
-    const sell0 = quote?.depth?.sell?.[0]?.price;
 
     return {
         type,
@@ -462,10 +394,10 @@ function buildUnifiedRow({ type, symbol, strike, optionType, expiry, quote, lotS
         ...(optionType ? { optionType } : {}),
         ...(expiry ? { expiry } : {}),
         ltp,
-        bid: (buy0 != null && buy0 > 0) ? buy0 : (quote?.bid && quote.bid > 0 ? quote.bid : ltp),
-        ask: (sell0 != null && sell0 > 0) ? sell0 : (quote?.ask && quote.ask > 0 ? quote.ask : ltp),
+        bid: quote?.depth?.buy?.[0]?.price || 0,
+        ask: quote?.depth?.sell?.[0]?.price || 0,
         oi: quote?.oi || 0,
-        volume: quote?.volume || quote?.volume_traded || 0,
+        volume: quote?.volume || 0,
         change: chgPct,
         open: quote?.ohlc?.open || 0,
         high: quote?.ohlc?.high || 0,
@@ -770,67 +702,24 @@ async function buildKiteDashboardPayload(userId) {
     const subList = allSymbols.map(sym => ({ symbol: sym, token: getTokenSync(sym) })).filter(i => i.token);
     marketDataService.bulkSubscribe(subList);
 
-    let streamData = marketDataService.getPricesBatch(allSymbols);
-
-    // If streamData has no prices yet (e.g. initial startup before WebSocket ticks), seed from REST API
-    const hasLivePrices = Object.values(streamData).some(s => s && (s.ltp || s.last_price));
-    if (!hasLivePrices && kiteService.isAuthenticated()) {
-        try {
-            const missingSymbols = allSymbols.filter(sym => !streamData[sym] || !(streamData[sym].ltp || streamData[sym].last_price));
-            const BATCH_SIZE = 100;
-            const quotePromises = [];
-            for (let i = 0; i < missingSymbols.length; i += BATCH_SIZE) {
-                quotePromises.push(kiteService.getQuote(missingSymbols.slice(i, i + BATCH_SIZE)).catch(() => ({})));
-            }
-            const quoteResults = await Promise.all(quotePromises);
-            for (const r of quoteResults) {
-                if (r && typeof r === 'object') {
-                    for (const [sym, q] of Object.entries(r)) {
-                        if (q) {
-                            const prev = marketDataService.prices[sym] || {};
-                            const ltp = q.last_price || q.ltp || prev.ltp || 0;
-                            const buy0 = q.depth?.buy?.[0]?.price;
-                            const sell0 = q.depth?.sell?.[0]?.price;
-                            marketDataService.prices[sym] = {
-                                ...prev,
-                                symbol: sym,
-                                ltp,
-                                bid: (buy0 != null && buy0 > 0) ? buy0 : (q.bid && q.bid > 0 ? q.bid : ltp),
-                                ask: (sell0 != null && sell0 > 0) ? sell0 : (q.ask && q.ask > 0 ? q.ask : ltp),
-                                volume: q.volume || q.volume_traded || prev.volume || 0,
-                                change: q.change || q.net_change || prev.change || 0,
-                                ohlc: q.ohlc || prev.ohlc || {},
-                                depth: q.depth || prev.depth || {}
-                            };
-                        }
-                    }
-                }
-            }
-            streamData = marketDataService.getPricesBatch(allSymbols);
-        } catch (_) {}
-    }
-
+    const streamData = marketDataService.getPricesBatch(allSymbols);
     const formatted = {};
 
     for (const symbol of allSymbols) {
         const quote = streamData[symbol];
-        const ltp = quote?.ltp || quote?.last_price || 0;
-        const buy0 = quote?.depth?.buy?.[0]?.price;
-        const sell0 = quote?.depth?.sell?.[0]?.price;
-        const close = quote?.ohlc?.close || 0;
         formatted[symbol] = {
             symbol,
-            ltp,
-            vol: quote?.volume || quote?.volume_traded || 0,
+            ltp: quote?.ltp || 0,
+            vol: quote?.volume || 0,
             oi: quote?.oi || 0,
-            chg: quote?.change || quote?.net_change || 0,
-            chg_pct: close ? (((ltp - close) / close) * 100).toFixed(2) : "0.00",
+            chg: quote?.change || 0,
+            chg_pct: quote?.ohlc?.close ? (((quote.ltp - quote.ohlc.close) / quote.ohlc.close) * 100).toFixed(2) : "0.00",
             open: quote?.ohlc?.open || 0,
             high: quote?.ohlc?.high || 0,
             low: quote?.ohlc?.low || 0,
-            close: close,
-            bid: (buy0 != null && buy0 > 0) ? buy0 : (quote?.bid && quote.bid > 0 ? quote.bid : ltp),
-            ask: (sell0 != null && sell0 > 0) ? sell0 : (quote?.ask && quote.ask > 0 ? quote.ask : ltp),
+            close: quote?.ohlc?.close || 0,
+            bid: quote?.depth?.buy?.[0]?.price || 0,
+            ask: quote?.depth?.sell?.[0]?.price || 0,
             time: new Date().toISOString()
         };
     }
@@ -1405,45 +1294,14 @@ async function _buildWatchlistData(query, userId) {
         return 0;
     });
 
-    // ── Step 5: Batch quote fetch for ALL symbols (chunks of 100 to stay within URL length limits) ──
+    // ── Step 5: ONE batch quote fetch for ALL symbols ──
     const allKeys = [...pc.nseKeys, ...allNfoFutKeys, ...nfoOptKeys, ...mcxFutKeys, ...mcxOptKeys];
     const uniqueKeys = Array.from(new Set(allKeys));
     const rawQuotes = {};
     const chunks = [];
-    const BATCH_SIZE = 100;
-    for (let i = 0; i < uniqueKeys.length; i += BATCH_SIZE) chunks.push(uniqueKeys.slice(i, i + BATCH_SIZE));
-    const results = await Promise.all(chunks.map((chunk, idx) => 
-        kiteService.getQuote(chunk).catch(err => {
-            console.error(`⚠️ [Watchlist Step 5] getQuote chunk ${idx} (${chunk.length} items) error:`, err.message);
-            return {};
-        })
-    ));
+    for (let i = 0; i < uniqueKeys.length; i += 500) chunks.push(uniqueKeys.slice(i, i + 500));
+    const results = await Promise.all(chunks.map(chunk => kiteService.getQuote(chunk).catch(() => ({}))));
     for (const r of results) if (r && typeof r === 'object') Object.assign(rawQuotes, r);
-    console.log(`📊 [Watchlist Step 5] Batch quote fetched: ${Object.keys(rawQuotes).length}/${uniqueKeys.length} quotes loaded`);
-
-    // Feed rawQuotes into marketDataService cache so socket feeds have non-zero prices immediately
-    try {
-        const marketDataService = require('../services/MarketDataService');
-        for (const [sym, q] of Object.entries(rawQuotes)) {
-            if (q && (q.last_price || q.ltp)) {
-                const prev = marketDataService.prices[sym] || {};
-                const ltp = q.last_price || q.ltp || prev.ltp || 0;
-                const buy0 = q.depth?.buy?.[0]?.price;
-                const sell0 = q.depth?.sell?.[0]?.price;
-                marketDataService.prices[sym] = {
-                    ...prev,
-                    symbol: sym,
-                    ltp,
-                    bid: (buy0 != null && buy0 > 0) ? buy0 : (q.bid && q.bid > 0 ? q.bid : ltp),
-                    ask: (sell0 != null && sell0 > 0) ? sell0 : (q.ask && q.ask > 0 ? q.ask : ltp),
-                    volume: q.volume || q.volume_traded || prev.volume || 0,
-                    change: q.change || q.net_change || prev.change || 0,
-                    ohlc: q.ohlc || prev.ohlc || {},
-                    depth: q.depth || prev.depth || {}
-                };
-            }
-        }
-    } catch (_) {}
 
     // Fetch lot sizes from database (cached in RAM for 10 minutes to prevent full table scans on every request)
     const lotMap = await getLotMap();
