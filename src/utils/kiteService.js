@@ -472,12 +472,3 @@ class KiteService {
 }
 
 module.exports = new KiteService();
-const data = await response.json();
-
-if (data.status === 'success') {
-    return data.data;
-} else {
-    throw new Error(data.message || 'Kite API request failed');
-}
-
-module.exports = new KiteService();
