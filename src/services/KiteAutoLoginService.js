@@ -8,6 +8,7 @@ class KiteAutoLoginService {
         this._schedulerInitialized = false;
     }
 
+
     /**
      * Helper to generate 6-digit TOTP code across different otplib API versions
      */
