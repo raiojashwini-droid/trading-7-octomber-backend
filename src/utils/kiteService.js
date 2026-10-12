@@ -436,6 +436,10 @@ class KiteService {
                     console.error('❌ Auto re-login retry failed:', autoErr.message);
                 }
             }
+            if (endpoint.startsWith('/quote')) {
+                console.warn('⚠️ [KiteService] Ignored /quote 403 on invalid symbol. Returning empty quote.');
+                return {};
+            }
             throw new Error('Kite session expired (403). Please set a new access token.');
         }
 
