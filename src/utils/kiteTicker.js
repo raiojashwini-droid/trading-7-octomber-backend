@@ -70,10 +70,10 @@ class KiteTickerService extends EventEmitter {
                 const errMsg = err?.message || String(err);
                 if (errMsg.includes('403') || errMsg.includes('Forbidden') || errMsg.includes('expired') || errMsg.includes('Token')) {
                     console.log('⛔ Kite Ticker 403 / token expired — stopping reconnect');
-                    try { this.ticker.autoReconnect(false); } catch(e) {}
+                    try { this.ticker.autoReconnect(false); } catch (e) { }
                     this.connected = false;
                     this.fallbackToMock = true;
-                    try { this.ticker.disconnect(); } catch(e) {}
+                    try { this.ticker.disconnect(); } catch (e) { }
                     return;
                 }
                 console.error('Kite Ticker Error:', errMsg);

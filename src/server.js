@@ -349,8 +349,8 @@ runMigrations()
         // Auto-compute 100% active automated contracts on server startup
         try {
             const contractController = require('./controllers/contractController');
-            contractController.computeActiveAutomatedContracts().catch(() => {});
-        } catch (_) {}
+            contractController.computeActiveAutomatedContracts().catch(() => { });
+        } catch (_) { }
     })
     .catch((err) => {
         console.error('❌ Migration or background startup failed:', err.message);

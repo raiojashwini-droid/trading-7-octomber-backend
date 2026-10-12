@@ -345,7 +345,7 @@ class KiteService {
         const arr = Array.isArray(instruments) ? instruments : instruments.split(',');
         const queryMap = {};
         const kiteQuery = [];
-        
+
         arr.forEach(i => {
             const mapped = this._mapVirtualToMega(i);
             if (!queryMap[mapped]) queryMap[mapped] = [];
@@ -355,7 +355,7 @@ class KiteService {
 
         const uniqueQuery = [...new Set(kiteQuery)].join('&');
         const data = await this.makeRequest(`/quote/ltp?${uniqueQuery}`);
-        
+
         const result = {};
         for (const [mappedSym, val] of Object.entries(data)) {
             if (queryMap[mappedSym]) {
