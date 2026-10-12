@@ -770,7 +770,46 @@ async function buildKiteDashboardPayload(userId) {
     const subList = allSymbols.map(sym => ({ symbol: sym, token: getTokenSync(sym) })).filter(i => i.token);
     marketDataService.bulkSubscribe(subList);
 
-    const streamData = marketDataService.getPricesBatch(allSymbols);
+    let streamData = marketDataService.getPricesBatch(allSymbols);
+
+    // If streamData has no prices yet (e.g. initial startup before WebSocket ticks), seed from REST API
+    const hasLivePrices = Object.values(streamData).some(s => s && (s.ltp || s.last_price));
+    if (!hasLivePrices && kiteService.isAuthenticated()) {
+        try {
+            const missingSymbols = allSymbols.filter(sym => !streamData[sym] || !(streamData[sym].ltp || streamData[sym].last_price));
+            const BATCH_SIZE = 100;
+            const quotePromises = [];
+            for (let i = 0; i < missingSymbols.length; i += BATCH_SIZE) {
+                quotePromises.push(kiteService.getQuote(missingSymbols.slice(i, i + BATCH_SIZE)).catch(() => ({})));
+            }
+            const quoteResults = await Promise.all(quotePromises);
+            for (const r of quoteResults) {
+                if (r && typeof r === 'object') {
+                    for (const [sym, q] of Object.entries(r)) {
+                        if (q) {
+                            const prev = marketDataService.prices[sym] || {};
+                            const ltp = q.last_price || q.ltp || prev.ltp || 0;
+                            const buy0 = q.depth?.buy?.[0]?.price;
+                            const sell0 = q.depth?.sell?.[0]?.price;
+                            marketDataService.prices[sym] = {
+                                ...prev,
+                                symbol: sym,
+                                ltp,
+                                bid: (buy0 != null && buy0 > 0) ? buy0 : (q.bid && q.bid > 0 ? q.bid : ltp),
+                                ask: (sell0 != null && sell0 > 0) ? sell0 : (q.ask && q.ask > 0 ? q.ask : ltp),
+                                volume: q.volume || q.volume_traded || prev.volume || 0,
+                                change: q.change || q.net_change || prev.change || 0,
+                                ohlc: q.ohlc || prev.ohlc || {},
+                                depth: q.depth || prev.depth || {}
+                            };
+                        }
+                    }
+                }
+            }
+            streamData = marketDataService.getPricesBatch(allSymbols);
+        } catch (_) {}
+    }
+
     const formatted = {};
 
     for (const symbol of allSymbols) {
@@ -1366,14 +1405,45 @@ async function _buildWatchlistData(query, userId) {
         return 0;
     });
 
-    // ── Step 5: ONE batch quote fetch for ALL symbols ──
+    // ── Step 5: Batch quote fetch for ALL symbols (chunks of 100 to stay within URL length limits) ──
     const allKeys = [...pc.nseKeys, ...allNfoFutKeys, ...nfoOptKeys, ...mcxFutKeys, ...mcxOptKeys];
     const uniqueKeys = Array.from(new Set(allKeys));
     const rawQuotes = {};
     const chunks = [];
-    for (let i = 0; i < uniqueKeys.length; i += 500) chunks.push(uniqueKeys.slice(i, i + 500));
-    const results = await Promise.all(chunks.map(chunk => kiteService.getQuote(chunk).catch(() => ({}))));
+    const BATCH_SIZE = 100;
+    for (let i = 0; i < uniqueKeys.length; i += BATCH_SIZE) chunks.push(uniqueKeys.slice(i, i + BATCH_SIZE));
+    const results = await Promise.all(chunks.map((chunk, idx) => 
+        kiteService.getQuote(chunk).catch(err => {
+            console.error(`⚠️ [Watchlist Step 5] getQuote chunk ${idx} (${chunk.length} items) error:`, err.message);
+            return {};
+        })
+    ));
     for (const r of results) if (r && typeof r === 'object') Object.assign(rawQuotes, r);
+    console.log(`📊 [Watchlist Step 5] Batch quote fetched: ${Object.keys(rawQuotes).length}/${uniqueKeys.length} quotes loaded`);
+
+    // Feed rawQuotes into marketDataService cache so socket feeds have non-zero prices immediately
+    try {
+        const marketDataService = require('../services/MarketDataService');
+        for (const [sym, q] of Object.entries(rawQuotes)) {
+            if (q && (q.last_price || q.ltp)) {
+                const prev = marketDataService.prices[sym] || {};
+                const ltp = q.last_price || q.ltp || prev.ltp || 0;
+                const buy0 = q.depth?.buy?.[0]?.price;
+                const sell0 = q.depth?.sell?.[0]?.price;
+                marketDataService.prices[sym] = {
+                    ...prev,
+                    symbol: sym,
+                    ltp,
+                    bid: (buy0 != null && buy0 > 0) ? buy0 : (q.bid && q.bid > 0 ? q.bid : ltp),
+                    ask: (sell0 != null && sell0 > 0) ? sell0 : (q.ask && q.ask > 0 ? q.ask : ltp),
+                    volume: q.volume || q.volume_traded || prev.volume || 0,
+                    change: q.change || q.net_change || prev.change || 0,
+                    ohlc: q.ohlc || prev.ohlc || {},
+                    depth: q.depth || prev.depth || {}
+                };
+            }
+        }
+    } catch (_) {}
 
     // Fetch lot sizes from database (cached in RAM for 10 minutes to prevent full table scans on every request)
     const lotMap = await getLotMap();

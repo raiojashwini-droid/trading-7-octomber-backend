@@ -138,7 +138,28 @@ class KiteAutoLoginService {
                 puppeteer = puppeteer.default;
             }
 
-            const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
+            const fs = require('fs');
+            let executablePath = (process.env.PUPPETEER_EXECUTABLE_PATH || '').replace(/['"]/g, '').trim() || undefined;
+            if (executablePath && !fs.existsSync(executablePath)) {
+                console.warn(`[KiteAutoLogin] Configured PUPPETEER_EXECUTABLE_PATH does not exist: "${executablePath}". Probing system paths...`);
+                executablePath = undefined;
+            }
+            if (!executablePath) {
+                const candidates = [
+                    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+                    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+                    process.env.LOCALAPPDATA ? `${process.env.LOCALAPPDATA}\\Google\\Chrome\\Application\\chrome.exe` : null,
+                    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+                    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+                    '/usr/bin/google-chrome',
+                    '/usr/bin/chromium-browser',
+                    '/usr/bin/chromium'
+                ].filter(Boolean);
+                executablePath = candidates.find(p => fs.existsSync(p)) || undefined;
+                if (executablePath) {
+                    console.log(`[KiteAutoLogin] Using detected browser executable: ${executablePath}`);
+                }
+            }
 
             browser = await puppeteer.launch({
                 headless: 'new',
@@ -185,11 +206,15 @@ class KiteAutoLoginService {
             await page.goto(loginUrl, { waitUntil: 'networkidle2', timeout: 30000 });
 
             // 1. Enter User ID & Password
-            await page.waitForSelector('input[type="text"]', { timeout: 10000 });
-            await page.type('input[type="text"]', userId, { delay: 30 });
+            const userSelector = 'input#userid, input[type="text"]';
+            await page.waitForSelector(userSelector, { timeout: 15000 });
+            await page.focus(userSelector).catch(() => {});
+            await page.type(userSelector, userId, { delay: 30 });
 
-            await page.waitForSelector('input[type="password"]', { timeout: 10000 });
-            await page.type('input[type="password"]', password, { delay: 30 });
+            const passSelector = 'input#password, input[type="password"]';
+            await page.waitForSelector(passSelector, { timeout: 15000 });
+            await page.focus(passSelector).catch(() => {});
+            await page.type(passSelector, password, { delay: 30 });
 
             console.log(`[KiteAutoLogin] Submitting User ID & Password...`);
             await page.click('button[type="submit"]').catch(() => page.keyboard.press('Enter'));
@@ -202,7 +227,7 @@ class KiteAutoLoginService {
             console.log(`[KiteAutoLogin] Generated 6-digit TOTP code: ${totpCode}`);
 
             // 4. Enter TOTP directly using page.type on selector
-            const totpSelector = 'input[type="text"], input[type="number"]';
+            const totpSelector = 'input#totp, input[autocomplete="one-time-code"], input[type="text"], input[type="number"]';
             await page.waitForSelector(totpSelector, { timeout: 15000 });
             await page.focus(totpSelector).catch(() => { });
             await page.type(totpSelector, String(totpCode), { delay: 50 });

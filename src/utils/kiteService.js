@@ -186,8 +186,26 @@ class KiteService {
 
     // ─── STATUS & SELF-HEALING ─────────────────────────────
 
-    async ensureSessionValid() {
-        if (this.accessToken && this.sessionData?.saved_at) {
+    async testTokenHealth() {
+        if (!this.accessToken) return false;
+        try {
+            const headers = this.createHeaders();
+            const res = await fetch(`${BASE_URL}/user/profile`, { method: 'GET', headers });
+            if (res.status === 200) return true;
+            if (res.status === 403) {
+                console.warn('⚠️ [KiteService] Saved token is expired/revoked (HTTP 403). Clearing session...');
+                this.clearSession();
+                return false;
+            }
+            return false;
+        } catch (err) {
+            console.warn('⚠️ [KiteService] Token health check error:', err.message);
+            return false;
+        }
+    }
+
+    async ensureSessionValid(forceCheck = false) {
+        if (this.accessToken && this.sessionData?.saved_at && !forceCheck) {
             const savedDate = getIstDateStr(this.sessionData.saved_at);
             const today = getIstDateStr();
             if (savedDate === today) {
@@ -197,16 +215,14 @@ class KiteService {
 
         const loaded = await this.loadSessionFromDb();
         if (loaded && this.accessToken) {
-            return true;
+            const isHealthy = await this.testTokenHealth();
+            if (isHealthy) return true;
         }
 
-        const { hour, minute } = getIstHourAndMinute();
-        const isPast830 = (hour > 8 || (hour === 8 && minute >= 30));
-
-        if (isPast830 && process.env.ZERODHA_USER_ID && process.env.ZERODHA_PASSWORD && process.env.ZERODHA_TOTP_SECRET) {
+        if (process.env.ZERODHA_USER_ID && process.env.ZERODHA_PASSWORD && process.env.ZERODHA_TOTP_SECRET) {
             if (!this._isAutoLoggingIn) {
                 this._isAutoLoggingIn = true;
-                console.log('🔄 [Self-Healing] Session missing post-8:30 AM IST. Auto-login triggering...');
+                console.log('🔄 [Self-Healing] Session invalid or expired. Triggering automated Zerodha login...');
                 try {
                     const kiteAutoLoginService = require('../services/KiteAutoLoginService');
                     await kiteAutoLoginService.autoLogin();
@@ -448,6 +464,7 @@ class KiteService {
 
         // Token expired (403) — auto re-login and retry
         if (response.status === 403) {
+            this.clearSession();
             if (!isRetry && process.env.ZERODHA_USER_ID && process.env.ZERODHA_PASSWORD && process.env.ZERODHA_TOTP_SECRET) {
                 console.warn(`⚠️ [KiteService] Received 403 on ${endpoint}. Attempting automatic re-login & retry...`);
                 try {

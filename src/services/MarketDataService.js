@@ -385,7 +385,7 @@ class MarketDataService extends EventEmitter {
             const kiteService = require('../utils/kiteService');
             if (!kiteService.isAuthenticated()) return;
 
-            const batchSize = 500;
+            const batchSize = 100;
             for (let i = 0; i < symbols.length; i += batchSize) {
                 const batch = symbols.slice(i, i + batchSize);
                 const quotes = await kiteService.getQuote(batch);
