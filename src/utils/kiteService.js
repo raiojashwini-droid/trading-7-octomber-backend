@@ -453,6 +453,7 @@ class KiteService {
                 try {
                     const kiteAutoLoginService = require('../services/KiteAutoLoginService');
                     await kiteAutoLoginService.autoLogin();
+                    await this.loadSessionFromDb();
                     return await this.makeRequest(endpoint, method, body, true);
                 } catch (autoErr) {
                     console.error('❌ Auto re-login retry failed:', autoErr.message);

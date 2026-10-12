@@ -109,6 +109,21 @@ class KiteAutoLoginService {
      * @returns {Promise<{success: boolean, message: string, session?: Object}>}
      */
     async autoLogin(customCreds = {}) {
+        if (this._inProgressLoginPromise) {
+            console.log('⏳ [KiteAutoLogin] Login already in progress. Reusing active session request...');
+            return this._inProgressLoginPromise;
+        }
+
+        this._inProgressLoginPromise = (async () => {
+            return await this._performAutoLogin(customCreds);
+        })().finally(() => {
+            this._inProgressLoginPromise = null;
+        });
+
+        return this._inProgressLoginPromise;
+    }
+
+    async _performAutoLogin(customCreds = {}) {
         const apiKey = (process.env.KITE_API_KEY || '').trim();
         const userId = customCreds.userId || (process.env.ZERODHA_USER_ID || '').trim();
         const password = customCreds.password || (process.env.ZERODHA_PASSWORD || '').trim();
