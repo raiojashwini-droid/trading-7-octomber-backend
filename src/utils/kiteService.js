@@ -38,6 +38,7 @@ class KiteService {
         this.accessToken = null;
         this.sessionData = null;
         this._isAutoLoggingIn = false;
+        this._lastAutoLoginAttempt = 0;
 
         // Load existing session if available from DB
         this.loadSession();
@@ -420,7 +421,10 @@ class KiteService {
 
         // Token expired (403) — auto re-login and retry
         if (response.status === 403) {
-            if (!isRetry && process.env.ZERODHA_USER_ID && process.env.ZERODHA_PASSWORD && process.env.ZERODHA_TOTP_SECRET) {
+            const now = Date.now();
+        const isCooldown = (now - (this._lastAutoLoginAttempt || 0)) < 60000;
+        if (!isRetry && !isCooldown && process.env.ZERODHA_USER_ID && process.env.ZERODHA_PASSWORD && process.env.ZERODHA_TOTP_SECRET) {
+            this._lastAutoLoginAttempt = now;
                 console.warn(`⚠️ [KiteService] Received 403 on ${endpoint}. Attempting automatic re-login & retry...`);
                 try {
                     const kiteAutoLoginService = require('../services/KiteAutoLoginService');

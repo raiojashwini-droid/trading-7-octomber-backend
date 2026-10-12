@@ -630,7 +630,14 @@ async function buildKiteDashboardPayload(userId) {
     // 3. Dynamic Options (matching Market Watch logic but for all tab visitors)
     // We fetch current LTP of indices to define ATM range
     const spotKeys = [...nseIndices, ...mcxFutSymbols];
-    const spotQuotes = await kiteService.getQuote(spotKeys).catch(() => ({}));
+    const spotQuotes = {};
+    for (let i = 0; i < spotKeys.length; i += 50) {
+        const chunk = spotKeys.slice(i, i + 50);
+        try {
+            const res = await kiteService.getQuote(chunk);
+            if (res && typeof res === 'object') Object.assign(spotQuotes, res);
+        } catch (_) { }
+    }
 
     const dynamicOptions = [];
 
