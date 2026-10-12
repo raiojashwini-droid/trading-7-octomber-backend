@@ -383,8 +383,10 @@ function toYmd(dateLike) {
 }
 
 function buildUnifiedRow({ type, symbol, strike, optionType, expiry, quote, lotSize }) {
-    const ltp = quote?.last_price || 0;
-    const close = quote?.ohlc?.close || 0;
+    const marketDataService = require('../services/MarketDataService');
+    const stream = marketDataService.getPrice(symbol) || {};
+    const ltp = quote?.last_price || stream.ltp || 0;
+    const close = quote?.ohlc?.close || stream.close || 0;
     const chgPct = close ? Number((((ltp - close) / close) * 100).toFixed(2)) : 0;
 
     return {
@@ -394,8 +396,8 @@ function buildUnifiedRow({ type, symbol, strike, optionType, expiry, quote, lotS
         ...(optionType ? { optionType } : {}),
         ...(expiry ? { expiry } : {}),
         ltp,
-        bid: quote?.depth?.buy?.[0]?.price || 0,
-        ask: quote?.depth?.sell?.[0]?.price || 0,
+        bid: quote?.depth?.buy?.[0]?.price || stream.bid || 0,
+        ask: quote?.depth?.sell?.[0]?.price || stream.ask || 0,
         oi: quote?.oi || 0,
         volume: quote?.volume || 0,
         change: chgPct,
@@ -1306,7 +1308,7 @@ async function _buildWatchlistData(query, userId) {
     const uniqueKeys = Array.from(new Set(allKeys));
     const rawQuotes = {};
     const chunks = [];
-    for (let i = 0; i < uniqueKeys.length; i += 500) chunks.push(uniqueKeys.slice(i, i + 500));
+    for (let i = 0; i < uniqueKeys.length; i += 100) chunks.push(uniqueKeys.slice(i, i + 100));
     const results = await Promise.all(chunks.map(chunk => kiteService.getQuote(chunk).catch(() => ({}))));
     for (const r of results) if (r && typeof r === 'object') Object.assign(rawQuotes, r);
 
