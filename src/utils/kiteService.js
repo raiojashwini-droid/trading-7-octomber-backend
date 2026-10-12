@@ -426,9 +426,7 @@ class KiteService {
                     const kiteAutoLoginService = require('../services/KiteAutoLoginService');
                     await kiteAutoLoginService.autoLogin();
                     // Ensure the updated token from DB/memory is actively reflected
-                    if (!this.accessToken) {
-                        await this.loadSessionFromDb();
-                    }
+                    await this.loadSessionFromDb();
                     return await this.makeRequest(endpoint, method, body, true);
                 } catch (autoErr) {
                     console.error('❌ Auto re-login retry failed:', autoErr.message);
