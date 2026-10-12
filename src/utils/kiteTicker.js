@@ -56,8 +56,14 @@ class KiteTickerService extends EventEmitter {
 
                 if (this.subscribedTokens.length > 0) {
                     this.ticker.subscribe(this.subscribedTokens);
-                    this.ticker.setMode(this.ticker.modeFull, this.subscribedTokens);
-                    console.log(`📊 Subscribed to ${this.subscribedTokens.length} instruments`);
+                    const MAX_FULL = 200;
+                    if (this.subscribedTokens.length <= MAX_FULL) {
+                        this.ticker.setMode(this.ticker.modeFull, this.subscribedTokens);
+                    } else {
+                        this.ticker.setMode(this.ticker.modeFull, this.subscribedTokens.slice(0, MAX_FULL));
+                        this.ticker.setMode(this.ticker.modeQuote, this.subscribedTokens.slice(MAX_FULL));
+                    }
+                    console.log(`📊 Subscribed to ${this.subscribedTokens.length} instruments (Full: ${Math.min(this.subscribedTokens.length, MAX_FULL)}, Quote: ${Math.max(0, this.subscribedTokens.length - MAX_FULL)})`);
                 }
             });
 
@@ -253,7 +259,15 @@ class KiteTickerService extends EventEmitter {
         });
         if (this.connected && this.ticker) {
             this.ticker.subscribe(tokens);
-            this.ticker.setMode(this.ticker.modeFull, tokens);
+            const MAX_FULL = 200;
+            if (this.subscribedTokens.length <= MAX_FULL) {
+                this.ticker.setMode(this.ticker.modeFull, tokens);
+            } else {
+                const fullTokens = tokens.slice(0, MAX_FULL);
+                const quoteTokens = tokens.slice(MAX_FULL);
+                if (fullTokens.length) this.ticker.setMode(this.ticker.modeFull, fullTokens);
+                if (quoteTokens.length) this.ticker.setMode(this.ticker.modeQuote, quoteTokens);
+            }
         }
         this.saveSubscriptions();
     }

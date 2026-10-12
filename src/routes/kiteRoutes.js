@@ -124,10 +124,41 @@ async function getInstrumentsFromCache() {
             };
 
             instruments.forEach(inst => {
-                const fullKey = `${inst.exchange}:${inst.tradingsymbol}`;
-                newMap.set(fullKey, inst.instrument_token);
-
+                const token = inst.instrument_token;
                 const ex = inst.exchange;
+                const ts = inst.tradingsymbol;
+                const fullKey = `${ex}:${ts}`;
+
+                // 1. Primary key: 'NSE:INFY', 'MCX:CRUDEOIL26MARFUT'
+                newMap.set(fullKey, token);
+
+                // 2. Bare tradingsymbol: 'INFY', 'CRUDEOIL26MARFUT'
+                if (!newMap.has(ts)) newMap.set(ts, token);
+
+                // 3. For EQ / STK: also register bare name and 'NSE:name'
+                if (inst.name && (inst.instrument_type === 'EQ' || inst.instrument_type === 'STK')) {
+                    const nameKey = `${ex}:${inst.name}`;
+                    if (!newMap.has(nameKey)) newMap.set(nameKey, token);
+                    if (!newMap.has(inst.name)) newMap.set(inst.name, token);
+                }
+
+                // 4. For Futures: register without 'FUT' suffix and with spaced expiry
+                if (inst.instrument_type === 'FUT' && ts) {
+                    const withoutFut = ts.replace(/FUT$/i, '');
+                    if (withoutFut) {
+                        newMap.set(`${ex}:${withoutFut}`, token);
+                        if (!newMap.has(withoutFut)) newMap.set(withoutFut, token);
+
+                        // Spaced variation: 'CRUDEOIL26MAR' -> 'CRUDEOIL 26MAR'
+                        const spaceMatch = withoutFut.match(/^(.*?)(\d{2}[A-Z]{3})$/);
+                        if (spaceMatch) {
+                            const spaced = `${spaceMatch[1]} ${spaceMatch[2]}`;
+                            newMap.set(`${ex}:${spaced}`, token);
+                            if (!newMap.has(spaced)) newMap.set(spaced, token);
+                        }
+                    }
+                }
+
                 const type = inst.instrument_type;
                 if (newIndex[ex]) {
                     if (type === 'EQ' || type === 'STK') {
@@ -145,7 +176,7 @@ async function getInstrumentsFromCache() {
             instrumentsCache = instruments;
             instrumentsCacheTime = now;
 
-            console.log(`✅ Indexed ${instruments.length} instruments`);
+            console.log(`✅ Indexed ${instruments.length} instruments (Total symbol aliases: ${newMap.size})`);
             return instruments;
         } catch (err) {
             console.error('❌ Failed to fetch/index instruments:', err.message);
@@ -159,7 +190,39 @@ async function getInstrumentsFromCache() {
 }
 
 function getTokenSync(symbol) {
-    return symbolTokenMap.get(symbol);
+    if (!symbol) return null;
+    const s = String(symbol).trim().toUpperCase();
+
+    // 1. Direct hit in map
+    let token = symbolTokenMap.get(s);
+    if (token) return token;
+
+    // 2. Space-collapsed hit
+    const noSpace = s.replace(/\s+/g, '');
+    token = symbolTokenMap.get(noSpace);
+    if (token) return token;
+
+    // 3. Fallback with exchange prefixes
+    if (!s.includes(':')) {
+        token = symbolTokenMap.get(`NSE:${s}`) ||
+                symbolTokenMap.get(`MCX:${s}`) ||
+                symbolTokenMap.get(`NFO:${s}`) ||
+                symbolTokenMap.get(`NSE:${noSpace}`) ||
+                symbolTokenMap.get(`MCX:${noSpace}`) ||
+                symbolTokenMap.get(`NFO:${noSpace}`) ||
+                symbolTokenMap.get(`MCX:${noSpace}FUT`) ||
+                symbolTokenMap.get(`NFO:${noSpace}FUT`) ||
+                symbolTokenMap.get(`${noSpace}FUT`);
+        if (token) return token;
+    } else {
+        const [prefix, raw] = s.split(':');
+        const cleanRaw = raw.replace(/\s+/g, '');
+        token = symbolTokenMap.get(`${prefix}:${cleanRaw}`) ||
+                symbolTokenMap.get(`${prefix}:${cleanRaw}FUT`);
+        if (token) return token;
+    }
+
+    return null;
 }
 
 // ── NIFTY 50 (50 stocks — Apr 2026 official list, Zerodha exact symbols) ──
@@ -342,18 +405,21 @@ function formatQuotes(rawQuotes) {
     const formatted = {};
     for (const [symbol, quote] of Object.entries(rawQuotes)) {
         try {
+            const ltpVal = quote.last_price || quote.ltp || 0;
+            const buy0 = quote.depth?.buy?.[0]?.price;
+            const sell0 = quote.depth?.sell?.[0]?.price;
             formatted[symbol] = {
                 symbol: symbol,
-                ltp: quote.last_price,
+                ltp: ltpVal,
                 vol: quote.volume || 0,
                 oi: quote.oi || 0,
-                chg: quote.net_change || 0,
+                chg: quote.net_change || quote.change || 0,
                 open: quote.ohlc?.open || 0,
                 high: quote.ohlc?.high || 0,
                 low: quote.ohlc?.low || 0,
                 close: quote.ohlc?.close || 0,
-                bid: quote.depth?.buy?.[0]?.price || 0,
-                ask: quote.depth?.sell?.[0]?.price || 0,
+                bid: (buy0 != null && buy0 > 0) ? buy0 : (quote.bid && quote.bid > 0 ? quote.bid : ltpVal),
+                ask: (sell0 != null && sell0 > 0) ? sell0 : (quote.ask && quote.ask > 0 ? quote.ask : ltpVal),
                 time: quote.timestamp || "1970-01-01 05:30:00"
             };
         } catch (e) { }
@@ -383,9 +449,11 @@ function toYmd(dateLike) {
 }
 
 function buildUnifiedRow({ type, symbol, strike, optionType, expiry, quote, lotSize }) {
-    const ltp = quote?.last_price || 0;
+    const ltp = quote?.last_price || quote?.ltp || 0;
     const close = quote?.ohlc?.close || 0;
     const chgPct = close ? Number((((ltp - close) / close) * 100).toFixed(2)) : 0;
+    const buy0 = quote?.depth?.buy?.[0]?.price;
+    const sell0 = quote?.depth?.sell?.[0]?.price;
 
     return {
         type,
@@ -394,10 +462,10 @@ function buildUnifiedRow({ type, symbol, strike, optionType, expiry, quote, lotS
         ...(optionType ? { optionType } : {}),
         ...(expiry ? { expiry } : {}),
         ltp,
-        bid: quote?.depth?.buy?.[0]?.price || 0,
-        ask: quote?.depth?.sell?.[0]?.price || 0,
+        bid: (buy0 != null && buy0 > 0) ? buy0 : (quote?.bid && quote.bid > 0 ? quote.bid : ltp),
+        ask: (sell0 != null && sell0 > 0) ? sell0 : (quote?.ask && quote.ask > 0 ? quote.ask : ltp),
         oi: quote?.oi || 0,
-        volume: quote?.volume || 0,
+        volume: quote?.volume || quote?.volume_traded || 0,
         change: chgPct,
         open: quote?.ohlc?.open || 0,
         high: quote?.ohlc?.high || 0,
@@ -707,19 +775,23 @@ async function buildKiteDashboardPayload(userId) {
 
     for (const symbol of allSymbols) {
         const quote = streamData[symbol];
+        const ltp = quote?.ltp || quote?.last_price || 0;
+        const buy0 = quote?.depth?.buy?.[0]?.price;
+        const sell0 = quote?.depth?.sell?.[0]?.price;
+        const close = quote?.ohlc?.close || 0;
         formatted[symbol] = {
             symbol,
-            ltp: quote?.ltp || 0,
-            vol: quote?.volume || 0,
+            ltp,
+            vol: quote?.volume || quote?.volume_traded || 0,
             oi: quote?.oi || 0,
-            chg: quote?.change || 0,
-            chg_pct: quote?.ohlc?.close ? (((quote.ltp - quote.ohlc.close) / quote.ohlc.close) * 100).toFixed(2) : "0.00",
+            chg: quote?.change || quote?.net_change || 0,
+            chg_pct: close ? (((ltp - close) / close) * 100).toFixed(2) : "0.00",
             open: quote?.ohlc?.open || 0,
             high: quote?.ohlc?.high || 0,
             low: quote?.ohlc?.low || 0,
-            close: quote?.ohlc?.close || 0,
-            bid: quote?.depth?.buy?.[0]?.price || 0,
-            ask: quote?.depth?.sell?.[0]?.price || 0,
+            close: close,
+            bid: (buy0 != null && buy0 > 0) ? buy0 : (quote?.bid && quote.bid > 0 ? quote.bid : ltp),
+            ask: (sell0 != null && sell0 > 0) ? sell0 : (quote?.ask && quote.ask > 0 ? quote.ask : ltp),
             time: new Date().toISOString()
         };
     }

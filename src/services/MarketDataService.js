@@ -246,7 +246,15 @@ class MarketDataService extends EventEmitter {
                 if (tokenNums.length > 0) {
                     try {
                         currentTicker.subscribe(tokenNums);
-                        currentTicker.setMode(currentTicker.modeFull, tokenNums);
+                        // Zerodha enforces a strict maximum of 200 instruments in modeFull.
+                        // Anything beyond 200 must be set to modeQuote to prevent Zerodha from dropping depth.
+                        const MAX_FULL_TOKENS = 200;
+                        if (tokenNums.length <= MAX_FULL_TOKENS) {
+                            currentTicker.setMode(currentTicker.modeFull, tokenNums);
+                        } else {
+                            currentTicker.setMode(currentTicker.modeFull, tokenNums.slice(0, MAX_FULL_TOKENS));
+                            currentTicker.setMode(currentTicker.modeQuote, tokenNums.slice(MAX_FULL_TOKENS));
+                        }
                     } catch (subErr) {
                         console.error('⚠️ Subscribe error on connect:', subErr.message);
                     }
@@ -323,8 +331,8 @@ class MarketDataService extends EventEmitter {
 
                 const buy0 = tick.depth?.buy?.[0]?.price;
                 const sell0 = tick.depth?.sell?.[0]?.price;
-                const hasBid = buy0 != null && Number.isFinite(Number(buy0));
-                const hasAsk = sell0 != null && Number.isFinite(Number(sell0));
+                const hasBid = buy0 != null && Number.isFinite(Number(buy0)) && Number(buy0) > 0;
+                const hasAsk = sell0 != null && Number.isFinite(Number(sell0)) && Number(sell0) > 0;
 
                 const ltp = tick.last_price != null ? tick.last_price : prev.ltp;
                 const isIndex = INDEX_SYMBOLS.has(symbol);
@@ -333,9 +341,9 @@ class MarketDataService extends EventEmitter {
                     ...prev,
                     symbol,
                     ltp,
-                    // For indices: no order book, so bid = ask = ltp
-                    bid: hasBid ? Number(buy0) : (isIndex ? ltp : (prev.bid || 0)),
-                    ask: hasAsk ? Number(sell0) : (isIndex ? ltp : (prev.ask || 0)),
+                    // For indices: no order book, so bid = ask = ltp. For stocks without depth, fall back to prev.bid or ltp instead of 0!
+                    bid: hasBid ? Number(buy0) : (isIndex ? ltp : (prev.bid && prev.bid > 0 ? prev.bid : (ltp || 0))),
+                    ask: hasAsk ? Number(sell0) : (isIndex ? ltp : (prev.ask && prev.ask > 0 ? prev.ask : (ltp || 0))),
                     change: tick.net_change != null ? tick.net_change : prev.change,
                     volume: tick.volume_traded != null ? tick.volume_traded : prev.volume,
                     ohlc: tick.ohlc && Object.keys(tick.ohlc).length ? tick.ohlc : (prev.ohlc || {}),
@@ -362,7 +370,50 @@ class MarketDataService extends EventEmitter {
 
         if (this.ticker && this.ticker.connected) {
             this.ticker.subscribe([parseInt(sToken)]);
-            this.ticker.setMode(this.ticker.modeFull, [parseInt(sToken)]);
+            const currentCount = this.subscribedTokens.size;
+            if (currentCount <= 200) {
+                this.ticker.setMode(this.ticker.modeFull, [parseInt(sToken)]);
+            } else {
+                this.ticker.setMode(this.ticker.modeQuote, [parseInt(sToken)]);
+            }
+        }
+    }
+
+    async seedQuotesWithRest(symbols = []) {
+        if (!Array.isArray(symbols) || symbols.length === 0) return;
+        try {
+            const kiteService = require('../utils/kiteService');
+            if (!kiteService.isAuthenticated()) return;
+
+            const batchSize = 500;
+            for (let i = 0; i < symbols.length; i += batchSize) {
+                const batch = symbols.slice(i, i + batchSize);
+                const quotes = await kiteService.getQuote(batch);
+                if (quotes && typeof quotes === 'object') {
+                    for (const [sym, q] of Object.entries(quotes)) {
+                        if (!q) continue;
+                        const prev = this.prices[sym] || {};
+                        const ltp = q.last_price || q.ltp || prev.ltp || 0;
+                        const buy0 = q.depth?.buy?.[0]?.price;
+                        const sell0 = q.depth?.sell?.[0]?.price;
+                        this.prices[sym] = {
+                            ...prev,
+                            symbol: sym,
+                            ltp,
+                            bid: (buy0 != null && buy0 > 0) ? buy0 : (prev.bid && prev.bid > 0 ? prev.bid : ltp),
+                            ask: (sell0 != null && sell0 > 0) ? sell0 : (prev.ask && prev.ask > 0 ? prev.ask : ltp),
+                            change: q.net_change ?? q.change ?? prev.change ?? 0,
+                            volume: q.volume_traded ?? q.volume ?? prev.volume ?? 0,
+                            ohlc: q.ohlc || prev.ohlc || {},
+                            depth: q.depth || prev.depth || {},
+                            type: sym.includes(':') ? sym.split(':')[0] : (prev.type || 'NSE')
+                        };
+                        this.dirtySymbols.add(sym);
+                    }
+                }
+            }
+        } catch (err) {
+            console.warn('⚠️ [MarketDataService] seedQuotesWithRest warning:', err.message);
         }
     }
 
@@ -370,6 +421,7 @@ class MarketDataService extends EventEmitter {
         if (!Array.isArray(items) || items.length === 0) return;
 
         const tokenNums = [];
+        const symbolsToSeed = [];
         for (const item of items) {
             if (!item?.symbol) continue;
             if (!item.token) {
@@ -382,11 +434,27 @@ class MarketDataService extends EventEmitter {
             this.instrumentMap[sToken].add(item.symbol);
             this.subscribedTokens.add(sToken);
             tokenNums.push(parseInt(sToken, 10));
+
+            if (!this.prices[item.symbol] || !this.prices[item.symbol].ltp) {
+                symbolsToSeed.push(item.symbol);
+            }
         }
 
         if (this.ticker && this.ticker.connected && tokenNums.length > 0) {
             this.ticker.subscribe(tokenNums);
-            this.ticker.setMode(this.ticker.modeFull, tokenNums);
+            // Zerodha modeFull allows up to 200 tokens. The rest are routed to modeQuote.
+            const MAX_FULL_TOKENS = 200;
+            if (tokenNums.length <= MAX_FULL_TOKENS) {
+                this.ticker.setMode(this.ticker.modeFull, tokenNums);
+            } else {
+                this.ticker.setMode(this.ticker.modeFull, tokenNums.slice(0, MAX_FULL_TOKENS));
+                this.ticker.setMode(this.ticker.modeQuote, tokenNums.slice(MAX_FULL_TOKENS));
+            }
+        }
+
+        // Fast background REST seed to populate memory immediately
+        if (symbolsToSeed.length > 0) {
+            this.seedQuotesWithRest(symbolsToSeed).catch(() => {});
         }
     }
 
