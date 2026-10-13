@@ -109,36 +109,7 @@ class KiteAuthService {
                 }
             }
 
-            if (!isConnected || !session || !session.access_token) return { connected: false };
-
-            // Quick live verification (cached 30 seconds to prevent hammering Kite)
-            const token = session.access_token;
-            const now = Date.now();
-            if (this._tokenValidationCache && this._tokenValidationCache.token === token && (now - this._tokenValidationCache.time) < 30000) {
-                if (!this._tokenValidationCache.valid) {
-                    return { connected: false, error: 'Token expired or rejected by Zerodha' };
-                }
-            } else {
-                try {
-                    const kite = new KiteConnect({ api_key: session.api_key || API_KEY });
-                    kite.setAccessToken(token);
-                    await kite.getProfile();
-                    this._tokenValidationCache = { token, valid: true, time: now };
-                } catch (kiteErr) {
-                    const errMsg = (kiteErr.message || '').toLowerCase();
-                    if (errMsg.includes('token') || errMsg.includes('403') || errMsg.includes('unauthorized') || errMsg.includes('forbidden') || errMsg.includes('session')) {
-                        console.warn(`[KiteAuthService] Token rejected by Zerodha: ${kiteErr.message}`);
-                        this._tokenValidationCache = { token, valid: false, time: now };
-                        // Invalidate token in DB so it doesn't report connected repeatedly
-                        if (session.user_id) {
-                            await kiteRepo.deleteSession(session.user_id).catch(() => {});
-                        }
-                        return { connected: false, error: 'Token expired or rejected by Zerodha' };
-                    }
-                    // Non-auth network glitch, do not eagerly disconnect
-                    console.warn(`[KiteAuthService] Status verification network notice: ${kiteErr.message}`);
-                }
-            }
+            if (!isConnected || !session) return { connected: false };
 
             return {
                 connected: true,

@@ -263,7 +263,7 @@ class KiteAutoLoginService {
             // Immediately re-initialize real-time market data socket feeds & WebSocket ticker
             try {
                 const marketDataService = require('./MarketDataService');
-                marketDataService.init(targetUserId, session.access_token).catch(() => { });
+                marketDataService.init(customCreds.userId || null).catch(() => { });
             } catch (_) { }
 
             return {

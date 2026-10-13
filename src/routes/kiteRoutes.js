@@ -6,6 +6,7 @@ const kiteService = require('../utils/kiteService');
 const kiteTicker = require('../utils/kiteTicker');
 const kiteAuthService = require('../services/KiteAuthService');
 const { authMiddleware } = require('../middleware/auth');
+const marketDataService = require('../services/MarketDataService');
 const { getUserBannedScripsStatus } = require('../utils/bannedHelper');
 const { getClientAllowedSegments, isScripSegmentAllowed } = require('../utils/segmentPermissionHelper');
 
@@ -383,7 +384,6 @@ function toYmd(dateLike) {
 }
 
 function buildUnifiedRow({ type, symbol, strike, optionType, expiry, quote, lotSize }) {
-    const marketDataService = require('../services/MarketDataService');
     const stream = marketDataService.getPrice(symbol) || {};
     const ltp = quote?.last_price || stream.ltp || 0;
     const close = quote?.ohlc?.close || stream.close || 0;
@@ -1308,7 +1308,7 @@ async function _buildWatchlistData(query, userId) {
     const uniqueKeys = Array.from(new Set(allKeys));
     const rawQuotes = {};
     const chunks = [];
-    for (let i = 0; i < uniqueKeys.length; i += 100) chunks.push(uniqueKeys.slice(i, i + 100));
+    for (let i = 0; i < uniqueKeys.length; i += 500) chunks.push(uniqueKeys.slice(i, i + 500));
     const results = await Promise.all(chunks.map(chunk => kiteService.getQuote(chunk).catch(() => ({}))));
     for (const r of results) if (r && typeof r === 'object') Object.assign(rawQuotes, r);
 
@@ -1351,6 +1351,14 @@ async function _buildWatchlistData(query, userId) {
     const _mcxOptCnt = rows.filter(r => r.type === 'MCX_OPT').length;
     console.log(`🔍 _buildWatchlistData rows: NSE=${_nseCnt} NFO_FUT=${_nfoFutCnt} NFO_OPT=${_nfoOptCnt} MCX_FUT=${_mcxFutCnt} MCX_OPT=${_mcxOptCnt} mcxFutKeys=${mcxFutKeys.length} nfoFutKeys=${allNfoFutKeys.length}(idx=${activeIndexFutKeys.length}+stk=${nfoStockFutKeys.length}) total=${rows.length}`);
     if (mcxFutKeys.length === 0) console.log(`🔍 mcxFutByBase keys: ${Object.keys(pc.mcxFutByBase).join(', ')}`);
+
+    // ── Step 8: Push via WebSocket ──
+    const io = require('../websocket/SocketManager').getIo();
+    if (io) {
+        const wsPayload = {};
+        for (const row of rows) wsPayload[row.symbol] = row;
+        io.emit('price_update', wsPayload);
+    }
 
     return rows;
 }
