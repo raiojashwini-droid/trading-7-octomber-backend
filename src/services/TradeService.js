@@ -99,7 +99,7 @@ class TradeService {
             const [tradeRows] = await connection.execute(
                 `SELECT t.*, cs.config_json, cs.broker_id 
                  FROM trades t
-                 JOIN client_settings cs ON t.user_id = cs.user_id
+                 LEFT JOIN client_settings cs ON t.user_id = cs.user_id
                  WHERE t.id = ? FOR UPDATE`,
                 [tradeId]
             );
@@ -286,9 +286,17 @@ class TradeService {
                         finalExitPrice = cachedPrice;
                         console.log(`[TradeService] ✅ Using cached bid/ask from ${cachedBidAsk.timestamp}: ${finalExitPrice} (Bid: ${cachedBidAsk.bid}, Ask: ${cachedBidAsk.ask})`);
                     } else {
-                        // 🎯 4. Final Fallback (Entry Price) - only if no cache available
-                        finalExitPrice = trade.entry_price;
-                        console.warn(`[TradeService] ⚠️ No cached bid/ask and no live price, using Entry Price: ${finalExitPrice}`);
+                        // Expired contracts leave the quote feed. Close at the same
+                        // baseline the screen uses, so PnL stays 0 instead of borrowing
+                        // another month's price. HOLD uses the last settlement.
+                        const heldBaseline = (trade.is_carried_forward == 1 || trade.status === 'HOLD')
+                            && trade.last_settlement_price !== null
+                            && trade.last_settlement_price !== undefined
+                            && parseFloat(trade.last_settlement_price) > 0;
+                        finalExitPrice = heldBaseline
+                            ? parseFloat(trade.last_settlement_price)
+                            : parseFloat(trade.entry_price);
+                        console.warn(`[TradeService] ⚠️ No cached bid/ask and no live price, using baseline: ${finalExitPrice}`);
                     }
                 }
             }

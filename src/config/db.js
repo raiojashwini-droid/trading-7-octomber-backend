@@ -17,23 +17,6 @@ if (fs.existsSync(envPath)) {
     }
 }
 
-const isValidDatabaseUrl = (urlStr) => {
-    if (!urlStr || typeof urlStr !== 'string') return false;
-    const trimmed = urlStr.trim();
-    if (!trimmed || trimmed === 'your-db-url' || trimmed.includes('your-db')) return false;
-    try {
-        const parsed = new URL(trimmed);
-        return parsed.protocol === 'mysql:' || parsed.protocol === 'mysqls:';
-    } catch {
-        return false;
-    }
-};
-
-if (process.env.DATABASE_URL && !isValidDatabaseUrl(process.env.DATABASE_URL)) {
-    console.warn(`⚠️ DATABASE_URL is set to a placeholder or invalid URL ("${process.env.DATABASE_URL}"). Falling back to local DB configuration.`);
-    delete process.env.DATABASE_URL;
-}
-
 let pool;
 
 if (process.env.DATABASE_URL) {
@@ -69,6 +52,78 @@ if (process.env.DATABASE_URL) {
 
   pool = mysql.createPool(dbConfig);
 }
+
+const { noteFinancialWrite, shouldBumpFinancialCache } = require('../utils/cacheManager');
+
+function wrapWriteAware(target, trackTransactions) {
+    const rawQuery = target.query.bind(target);
+    const rawExecute = target.execute.bind(target);
+    const afterStatement = async (sql) => {
+        if (!shouldBumpFinancialCache(sql)) return;
+        if (trackTransactions && target.__inFinancialTx) {
+            target.__financialDirty = true;
+            return;
+        }
+        await noteFinancialWrite(sql);
+    };
+    target.query = function (sql, params, cb) {
+        if (typeof params === 'function' || typeof cb === 'function') return rawQuery(sql, params, cb);
+        return Promise.resolve(rawQuery(sql, params)).then(async (result) => {
+            await afterStatement(sql);
+            return result;
+        });
+    };
+    target.execute = function (sql, params, cb) {
+        if (typeof params === 'function' || typeof cb === 'function') return rawExecute(sql, params, cb);
+        return Promise.resolve(rawExecute(sql, params)).then(async (result) => {
+            await afterStatement(sql);
+            return result;
+        });
+    };
+    if (trackTransactions && typeof target.beginTransaction === 'function' && !target.__txWrapped) {
+        const rawBegin = target.beginTransaction.bind(target);
+        const rawCommit = target.commit.bind(target);
+        const rawRollback = target.rollback.bind(target);
+        target.beginTransaction = async function () {
+            target.__inFinancialTx = true;
+            return rawBegin();
+        };
+        target.commit = async function () {
+            const result = await rawCommit();
+            target.__inFinancialTx = false;
+            if (target.__financialDirty) {
+                target.__financialDirty = false;
+                await noteFinancialWrite('UPDATE ledger SET id = id WHERE 0');
+            }
+            return result;
+        };
+        target.rollback = async function () {
+            const result = await rawRollback();
+            target.__inFinancialTx = false;
+            target.__financialDirty = false;
+            return result;
+        };
+        target.__txWrapped = true;
+    }
+    return target;
+}
+
+wrapWriteAware(pool, false);
+const rawGetConnection = pool.getConnection.bind(pool);
+pool.getConnection = async function () {
+    const connection = await rawGetConnection();
+    if (!connection.__writeAware) {
+        wrapWriteAware(connection, true);
+        const rawRelease = connection.release.bind(connection);
+        connection.release = function () {
+            connection.__inFinancialTx = false;
+            connection.__financialDirty = false;
+            return rawRelease();
+        };
+        connection.__writeAware = true;
+    }
+    return connection;
+};
 
 // ─── FORCE MYSQL SESSION TO IST ──────────────────────────────────────────────
 // AWS RDS defaults to UTC. We force the session to IST so CURRENT_TIMESTAMP is correct.

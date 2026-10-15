@@ -52,7 +52,6 @@ const ALLOWED_ORIGINS = [
     'https://traderss.kiaantechnology.com',
     'https://trading-software112.netlify.app',
     'https://app.shrishreenathjiglobaltraders.com',
-    'https://sahare-marketing-7-sep.netlify.app',
     process.env.FRONTEND_URL
 ].filter(Boolean);
 
@@ -195,6 +194,8 @@ runMigrations()
     .then(async () => {
         // Run background initializations without blocking server startup
         initializeCache().catch(e => console.error('[Cache] Init failed:', e.message));
+        const { warmTradeListCount } = require('./controllers/tradeController');
+        warmTradeListCount().catch(e => console.error('[Perf] trade count warm failed:', e.message));
         syncKiteInstrumentsOnStartup().catch(e => console.error('[Sync] Init failed:', e.message));
         const commodityLotService = require('./services/CommodityLotService');
         commodityLotService.load().catch(e => console.error('[CommodityLot] Init failed:', e.message));
@@ -349,8 +350,8 @@ runMigrations()
         // Auto-compute 100% active automated contracts on server startup
         try {
             const contractController = require('./controllers/contractController');
-            contractController.computeActiveAutomatedContracts().catch(() => { });
-        } catch (_) { }
+            contractController.computeActiveAutomatedContracts().catch(() => {});
+        } catch (_) {}
     })
     .catch((err) => {
         console.error('❌ Migration or background startup failed:', err.message);

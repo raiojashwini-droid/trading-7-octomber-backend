@@ -38,7 +38,6 @@ class KiteService {
         this.accessToken = null;
         this.sessionData = null;
         this._isAutoLoggingIn = false;
-        this._lastAutoLoginAttempt = 0;
 
         // Load existing session if available from DB
         this.loadSession();
@@ -58,8 +57,9 @@ class KiteService {
                     // Check if session is from today in IST (Kite tokens expire at ~6 AM next day IST)
                     const savedDate = getIstDateStr(data.saved_at);
                     const today = getIstDateStr();
+                    const kiteRepo = require('../repositories/KiteRepository');
 
-                    if (savedDate === today) {
+                    if (savedDate === today && kiteRepo.sessionMatchesEnv(data)) {
                         this.accessToken = data.access_token;
                         this.sessionData = {
                             access_token: data.access_token,
@@ -70,10 +70,15 @@ class KiteService {
                         };
                         console.log('📂 Kite session loaded from DB (today\'s IST token)');
                         return true;
-                    } else {
+                    }
+
+                    this.accessToken = null;
+                    this.sessionData = null;
+                    if (savedDate !== today) {
                         console.log('⚠️ Kite session expired in DB (old IST date). Need fresh login.');
-                        this.accessToken = null;
-                        this.sessionData = null;
+                    } else {
+                        const envUser = (process.env.ZERODHA_USER_ID || '').trim() || 'unset';
+                        console.log(`⚠️ Kite session in DB is for ${data.kite_user_id || 'unknown user'} (${data.user_name || 'unknown'}), .env user is ${envUser}. Need fresh login.`);
                     }
                 }
             } else {
@@ -426,7 +431,6 @@ class KiteService {
                 try {
                     const kiteAutoLoginService = require('../services/KiteAutoLoginService');
                     await kiteAutoLoginService.autoLogin();
-                    await this.loadSessionFromDb();
                     return await this.makeRequest(endpoint, method, body, true);
                 } catch (autoErr) {
                     console.error('❌ Auto re-login retry failed:', autoErr.message);

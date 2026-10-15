@@ -1,17 +1,5 @@
 const db = require('../config/db');
 
-// Simple in-memory cache with TTL for allowed segments per user
-const segmentCache = new Map();
-const SEGMENT_CACHE_TTL_MS = 60_000;
-
-function clearSegmentCache(userId) {
-    if (userId) {
-        segmentCache.delete(userId);
-    } else {
-        segmentCache.clear();
-    }
-}
-
 /**
  * Returns allowed trading segments for a user based on client_settings.config_json and user_segments.
  */
@@ -28,11 +16,6 @@ async function getClientAllowedSegments(userId, userRole) {
 
     if (!userId || userRole === 'SUPERADMIN' || userRole === 'ADMIN') {
         return defaultAllAllowed;
-    }
-
-    const cached = segmentCache.get(userId);
-    if (cached && (Date.now() - cached.ts) < SEGMENT_CACHE_TTL_MS) {
-        return cached.value;
     }
 
     try {
@@ -59,7 +42,6 @@ async function getClientAllowedSegments(userId, userRole) {
                 COMMODITY: isTruthy(config.comexTrading) || isTruthy(config.commodityTrading)
             };
 
-            segmentCache.set(userId, { ts: Date.now(), value: allowed });
             return allowed;
         }
 
@@ -75,7 +57,7 @@ async function getClientAllowedSegments(userId, userRole) {
                 segMap[r.segment] = r.is_enabled === 1;
             });
 
-            const allowed = {
+            return {
                 MCX_FUT: segMap['MCX'] !== false,
                 MCX_OPT: segMap['OPTIONS'] !== false || segMap['MCX'] !== false,
                 NFO_FUT: segMap['EQUITY'] !== false,
@@ -84,11 +66,8 @@ async function getClientAllowedSegments(userId, userRole) {
                 FOREX: segMap['FOREX'] !== false,
                 COMMODITY: segMap['COMEX'] !== false
             };
-            segmentCache.set(userId, { ts: Date.now(), value: allowed });
-            return allowed;
         }
 
-        segmentCache.set(userId, { ts: Date.now(), value: defaultAllAllowed });
         return defaultAllAllowed;
     } catch (err) {
         console.error('[getClientAllowedSegments] Error:', err);
@@ -145,6 +124,5 @@ function isScripSegmentAllowed(symbol, allowedMap) {
 
 module.exports = {
     getClientAllowedSegments,
-    isScripSegmentAllowed,
-    clearSegmentCache
+    isScripSegmentAllowed
 };

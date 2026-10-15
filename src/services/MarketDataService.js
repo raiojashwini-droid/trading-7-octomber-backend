@@ -194,7 +194,7 @@ class MarketDataService extends EventEmitter {
     //   ZERODHA (KITE) INTEGRATION
     // ══════════════════════════════════════════════════════
 
-    async init(userId, explicitToken = null) {
+    async init(userId) {
         if (this.isConnecting) return;
         this.isConnecting = true;
         try {
@@ -205,8 +205,11 @@ class MarketDataService extends EventEmitter {
             const repo = require('../repositories/KiteRepository');
             const kiteService = require('../utils/kiteService');
             let userSession = await repo.getSessionByUserId(userId);
-            if (!userSession || !userSession.access_token) {
+            if (!userSession || !userSession.access_token || !repo.sessionMatchesEnv(userSession)) {
                 userSession = await repo.getLatestSession();
+            }
+            if (!userSession || !repo.sessionMatchesEnv(userSession)) {
+                userSession = null;
             }
             let activeToken = kiteService.accessToken || (userSession ? userSession.access_token : null);
             if (!activeToken) {
@@ -291,7 +294,6 @@ class MarketDataService extends EventEmitter {
                 if (errMsg.includes('403') || errMsg.includes('Forbidden') || errMsg.includes('expired') || errMsg.includes('Token')) {
                     console.error('❌ Zerodha 403 Forbidden - Access token expired. Disabling auto-reconnect and stopping ticker.');
                     errorOccurred = true;
-                    this.isConnecting = false;
                     try { currentTicker.autoReconnect(false); } catch (e) { }
                     try { currentTicker.disconnect(); } catch (e) { }
                     if (this.ticker === currentTicker) {

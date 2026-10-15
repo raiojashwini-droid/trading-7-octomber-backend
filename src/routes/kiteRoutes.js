@@ -6,7 +6,6 @@ const kiteService = require('../utils/kiteService');
 const kiteTicker = require('../utils/kiteTicker');
 const kiteAuthService = require('../services/KiteAuthService');
 const { authMiddleware } = require('../middleware/auth');
-const marketDataService = require('../services/MarketDataService');
 const { getUserBannedScripsStatus } = require('../utils/bannedHelper');
 const { getClientAllowedSegments, isScripSegmentAllowed } = require('../utils/segmentPermissionHelper');
 
@@ -28,23 +27,6 @@ function checkSymbolMarked(sym, markSet) {
         if (m === sym || cleanM === cleanSym) return true;
     }
     return false;
-}
-
-// Shared in-memory lot-size cache (refreshes every 10 minutes)
-const LOT_MAP_CACHE_TTL_MS = 10 * 60 * 1000;
-async function getLotMap() {
-    if (global.LOT_MAP_CACHE && (Date.now() - (global.LOT_MAP_CACHE_TIME || 0)) < LOT_MAP_CACHE_TTL_MS) {
-        return global.LOT_MAP_CACHE;
-    }
-    const db = require('../config/db');
-    const [lotRows] = await db.execute('SELECT symbol, lot_size FROM scrip_data');
-    const map = {};
-    lotRows.forEach(r => {
-        if (r.symbol) map[r.symbol.toUpperCase()] = parseFloat(r.lot_size || 1);
-    });
-    global.LOT_MAP_CACHE = map;
-    global.LOT_MAP_CACHE_TIME = Date.now();
-    return map;
 }
 
 const router = express.Router();
@@ -384,9 +366,8 @@ function toYmd(dateLike) {
 }
 
 function buildUnifiedRow({ type, symbol, strike, optionType, expiry, quote, lotSize }) {
-    const stream = marketDataService.getPrice(symbol) || {};
-    const ltp = quote?.last_price || stream.ltp || 0;
-    const close = quote?.ohlc?.close || stream.close || 0;
+    const ltp = quote?.last_price || 0;
+    const close = quote?.ohlc?.close || 0;
     const chgPct = close ? Number((((ltp - close) / close) * 100).toFixed(2)) : 0;
 
     return {
@@ -396,8 +377,8 @@ function buildUnifiedRow({ type, symbol, strike, optionType, expiry, quote, lotS
         ...(optionType ? { optionType } : {}),
         ...(expiry ? { expiry } : {}),
         ltp,
-        bid: quote?.depth?.buy?.[0]?.price || stream.bid || 0,
-        ask: quote?.depth?.sell?.[0]?.price || stream.ask || 0,
+        bid: quote?.depth?.buy?.[0]?.price || 0,
+        ask: quote?.depth?.sell?.[0]?.price || 0,
         oi: quote?.oi || 0,
         volume: quote?.volume || 0,
         change: chgPct,
@@ -596,10 +577,16 @@ async function buildKiteDashboardPayload(userId) {
         try {
             const status = await kiteAuthService.getStatus(userId);
             if (status.connected) {
-                const session = await require('../repositories/KiteRepository').getSessionByUserId(userId);
-                if (session?.access_token) {
+                const kiteRepo = require('../repositories/KiteRepository');
+                const session = await kiteRepo.getSessionByUserId(userId);
+                if (session?.access_token && kiteRepo.sessionMatchesEnv(session)) {
                     kiteService.accessToken = session.access_token;
-                    kiteService.sessionData = { access_token: session.access_token, user_name: session.user_name };
+                    kiteService.sessionData = {
+                        access_token: session.access_token,
+                        user_name: session.user_name,
+                        user_id: session.kite_user_id,
+                        email: session.email
+                    };
                 }
             }
         } catch (_) { }
@@ -632,14 +619,7 @@ async function buildKiteDashboardPayload(userId) {
     // 3. Dynamic Options (matching Market Watch logic but for all tab visitors)
     // We fetch current LTP of indices to define ATM range
     const spotKeys = [...nseIndices, ...mcxFutSymbols];
-    const spotQuotes = {};
-    for (let i = 0; i < spotKeys.length; i += 50) {
-        const chunk = spotKeys.slice(i, i + 50);
-        try {
-            const res = await kiteService.getQuote(chunk);
-            if (res && typeof res === 'object') Object.assign(spotQuotes, res);
-        } catch (_) { }
-    }
+    const spotQuotes = await kiteService.getQuote(spotKeys).catch(() => ({}));
 
     const dynamicOptions = [];
 
@@ -1108,10 +1088,16 @@ async function _buildWatchlistData(query, userId) {
         try {
             const status = await kiteAuthService.getStatus(userId);
             if (status.connected) {
-                const session = await require('../repositories/KiteRepository').getSessionByUserId(userId);
-                if (session?.access_token) {
+                const kiteRepo = require('../repositories/KiteRepository');
+                const session = await kiteRepo.getSessionByUserId(userId);
+                if (session?.access_token && kiteRepo.sessionMatchesEnv(session)) {
                     kiteService.accessToken = session.access_token;
-                    kiteService.sessionData = { access_token: session.access_token, user_name: session.user_name };
+                    kiteService.sessionData = {
+                        access_token: session.access_token,
+                        user_name: session.user_name,
+                        user_id: session.kite_user_id,
+                        email: session.email
+                    };
                 }
             }
         } catch (_) { }
@@ -1312,8 +1298,18 @@ async function _buildWatchlistData(query, userId) {
     const results = await Promise.all(chunks.map(chunk => kiteService.getQuote(chunk).catch(() => ({}))));
     for (const r of results) if (r && typeof r === 'object') Object.assign(rawQuotes, r);
 
-    // Fetch lot sizes from database (cached in RAM for 10 minutes to prevent full table scans on every request)
-    const lotMap = await getLotMap();
+    // Fetch lot sizes from database (cached in RAM for 10 minutes to prevent 57,782 row DB queries on every tick)
+    if (!global.LOT_MAP_CACHE || (Date.now() - (global.LOT_MAP_CACHE_TIME || 0)) > 600000) {
+        const [lotRows] = await db.execute('SELECT symbol, lot_size FROM scrip_data');
+        const map = {};
+        lotRows.forEach(r => {
+            if (r.symbol) map[r.symbol.toUpperCase()] = parseFloat(r.lot_size || 1);
+        });
+        global.LOT_MAP_CACHE = map;
+        global.LOT_MAP_CACHE_TIME = Date.now();
+        console.log(`📊 Cached ${Object.keys(map).length} lot sizes from scrip_data in RAM`);
+    }
+    const lotMap = global.LOT_MAP_CACHE;
 
     const getLotSize = (key) => {
         const sym = key.includes(':') ? key.split(':')[1] : key;
@@ -1437,9 +1433,9 @@ router.get('/market/options-chain', authMiddleware, asyncHandler(async (req, res
         // Fallback: if LTP fetch fails, try the futures price
         if (!ltp) {
             try {
-                await getInstrumentsFromCache();
-                const futContract = indexedInstruments.NFO.FUT
-                    .filter(i => i.name === symbol)
+                const instruments = await getInstrumentsFromCache();
+                const futContract = instruments
+                    .filter(i => i.exchange === 'NFO' && i.name === symbol && i.instrument_type === 'FUT')
                     .sort((a, b) => new Date(a.expiry || 0) - new Date(b.expiry || 0))
                     .find(i => new Date(i.expiry) >= new Date());
 
@@ -1466,15 +1462,17 @@ router.get('/market/options-chain', authMiddleware, asyncHandler(async (req, res
             strikes.push(s);
         }
 
-        // ── 5. Find matching CE + PE instruments from pre-computed index ──
-        await getInstrumentsFromCache();
+        // ── 5. Find matching CE + PE instruments from cached instrument list ──
+        const instruments = await getInstrumentsFromCache();
 
         // Filter to only this symbol's options for the requested expiry
         // Normalize expiry formats: CSV may have "2026-04-24", "2026-04-24T00:00:00", "24-04-2026" etc.
         const requestedExpiry = new Date(expiry).toDateString(); // "Thu Apr 24 2026"
 
-        const optionInstruments = indexedInstruments.NFO.OPT.filter(i => {
+        const optionInstruments = instruments.filter(i => {
+            if (i.exchange !== 'NFO') return false;
             if (i.name !== symbol) return false;
+            if (i.instrument_type !== 'CE' && i.instrument_type !== 'PE') return false;
             // Robust expiry match — compare as Date objects
             const instrExpiry = new Date(i.expiry || 0).toDateString();
             return instrExpiry === requestedExpiry;
@@ -2053,12 +2051,16 @@ router.get('/market/search', authMiddleware, asyncHandler(async (req, res) => {
     const instruments = await getInstrumentsFromCache();
     const query = q.toUpperCase();
 
-    // Fetch lot sizes from scrip_data (cached) for script-wise dynamic values without strict matching
-    const lotMap = await getLotMap();
-    const scripList = Object.entries(lotMap).map(([symbol, lotSize]) => {
-        const sym = (symbol || '').toUpperCase().trim();
+    // Fetch lot sizes from scrip_data for script-wise dynamic values without strict matching
+    const [lotRows] = await db.execute('SELECT symbol, lot_size FROM scrip_data');
+    const scripList = lotRows.map(r => {
+        const sym = (r.symbol || '').toUpperCase().trim();
         const base = sym.replace(/\d+[A-Z]{3}\d*[CP]E$|\d+[A-Z]{3}\d*FUT$/i, '').trim();
-        return { symbol: sym, base, lotSize: parseFloat(lotSize || 1) };
+        return {
+            symbol: sym,
+            base: base,
+            lotSize: parseFloat(r.lot_size || 1)
+        };
     }).sort((a, b) => b.symbol.length - a.symbol.length);
 
     const getDynamicLotSize = (inst) => {
@@ -2204,12 +2206,16 @@ router.get('/instruments/search', authMiddleware, asyncHandler(async (req, res) 
     // BACKEND SEARCH LOGIC: Split by spaces and ensure every word is matched
     const searchTokens = q.toUpperCase().split(/\s+/).filter(t => t.length > 0);
 
-    // Fetch lot sizes from scrip_data (cached) for script-wise dynamic values without strict matching
-    const lotMap = await getLotMap();
-    const scripList = Object.entries(lotMap).map(([symbol, lotSize]) => {
-        const sym = (symbol || '').toUpperCase().trim();
+    // Fetch lot sizes from scrip_data for script-wise dynamic values without strict matching
+    const [lotRows] = await db.execute('SELECT symbol, lot_size FROM scrip_data');
+    const scripList = lotRows.map(r => {
+        const sym = (r.symbol || '').toUpperCase().trim();
         const base = sym.replace(/\d+[A-Z]{3}\d*[CP]E$|\d+[A-Z]{3}\d*FUT$/i, '').trim();
-        return { symbol: sym, base, lotSize: parseFloat(lotSize || 1) };
+        return {
+            symbol: sym,
+            base: base,
+            lotSize: parseFloat(r.lot_size || 1)
+        };
     }).sort((a, b) => b.symbol.length - a.symbol.length);
 
     const getDynamicLotSize = (inst) => {
@@ -2354,10 +2360,16 @@ async function fetchUnifiedWatchlistForSocket(userId, query = {}) {
             try {
                 const status = await kiteAuthService.getStatus(userId);
                 if (status.connected) {
-                    const session = await require('../repositories/KiteRepository').getSessionByUserId(userId);
-                    if (session?.access_token) {
+                    const kiteRepo = require('../repositories/KiteRepository');
+                    const session = await kiteRepo.getSessionByUserId(userId);
+                    if (session?.access_token && kiteRepo.sessionMatchesEnv(session)) {
                         kiteService.accessToken = session.access_token;
-                        kiteService.sessionData = { access_token: session.access_token, user_name: session.user_name };
+                        kiteService.sessionData = {
+                            access_token: session.access_token,
+                            user_name: session.user_name,
+                            user_id: session.kite_user_id,
+                            email: session.email
+                        };
                     }
                 }
             } catch (_) { }

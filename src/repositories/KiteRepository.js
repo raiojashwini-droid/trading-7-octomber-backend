@@ -21,6 +21,30 @@ class KiteRepository {
         return rows[0] || null;
     }
 
+    /**
+     * A stored row is usable only when it belongs to the Zerodha account in .env.
+     * Empty ZERODHA_USER_ID skips the user check (manual-login setups).
+     * A stored api_key that differs from KITE_API_KEY is rejected; a null api_key is allowed.
+     */
+    sessionMatchesEnv(session) {
+        if (!session || !session.access_token) return false;
+
+        const envUser = (process.env.ZERODHA_USER_ID || '').trim().toUpperCase();
+        const envKey = (process.env.KITE_API_KEY || '').trim();
+
+        if (envUser) {
+            const rowUser = (session.kite_user_id || '').trim().toUpperCase();
+            if (rowUser !== envUser) return false;
+        }
+
+        if (envKey) {
+            const rowKey = (session.api_key || '').trim();
+            if (rowKey && rowKey !== envKey) return false;
+        }
+
+        return true;
+    }
+
     async saveSession(userId, sessionData) {
         const {
             api_key,
