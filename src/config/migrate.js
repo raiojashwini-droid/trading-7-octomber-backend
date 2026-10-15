@@ -17,7 +17,7 @@ const fetchSchemaInfoOnce = async () => {
             `SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()`
         );
         existingColumns = new Set(columnsInfo.map(row => `${row.TABLE_NAME.toLowerCase()}.${row.COLUMN_NAME.toLowerCase()}`));
-
+        
         const [indexesInfo] = await db.execute(
             `SELECT TABLE_NAME, INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE()`
         );
@@ -249,16 +249,18 @@ const runMigrations = async () => {
 
     // Add market_type to trades & scrip_data for existing DBs
     await addColumn('trades', 'market_type', "VARCHAR(50) DEFAULT 'MCX' AFTER is_pending");
-    try { await db.execute("ALTER TABLE trades MODIFY COLUMN market_type VARCHAR(50) DEFAULT 'MCX'"); } catch (_) { }
+    // Do not MODIFY this column on every boot. On a large trades table that
+    // rebuilds the whole table and blocks login.
     await addColumn('trades', 'brokerage', "DECIMAL(18,4) DEFAULT 0 AFTER pnl");
     await addColumn('trades', 'swap', "DECIMAL(18,4) DEFAULT 0 AFTER brokerage");
     await addColumn('trades', 'created_by', "INT DEFAULT NULL AFTER trade_ip");
     await addColumn('trades', 'trade_type', "VARCHAR(50) DEFAULT 'INTRADAY' AFTER created_by");
     await addColumn('trades', 'margin_type', "VARCHAR(50) DEFAULT 'PER_LOT_BASIS' AFTER trade_type");
     await addColumn('trades', 'close_ip', "VARCHAR(45) DEFAULT NULL");
-
+    
     // Add carry forward & settlement tracking columns to trades
-    try { await db.execute("ALTER TABLE trades MODIFY COLUMN status ENUM('OPEN','CLOSED','HOLD','SETTLED','CANCELLED','DELETED') NOT NULL DEFAULT 'OPEN'"); } catch (_) { }
+    // Status enum is already wide enough. Re-applying MODIFY on every boot
+    // rewrites every trade row and locks the table.
     await addColumn('trades', 'is_carried_forward', 'TINYINT(1) DEFAULT 0');
     await addColumn('trades', 'carry_forward_from_week', 'VARCHAR(30) DEFAULT NULL');
     await addColumn('trades', 'carry_forward_to_week', 'VARCHAR(30) DEFAULT NULL');
@@ -270,19 +272,7 @@ const runMigrations = async () => {
     await addColumn('trades', 'accumulated_settled_pnl', 'DECIMAL(18,4) DEFAULT 0');
     await addIndex('trades', 'idx_trades_settlement', 'settlement_id');
     await addIndex('trades', 'idx_trades_cf', 'is_carried_forward');
-    await addIndex('trades', 'idx_trades_user_status_id', 'user_id, status, id');
     await addIndex('trades', 'idx_trades_status_id', 'status, id');
-    await addIndex('trades', 'idx_trades_symbol', 'symbol');
-    await addIndex('trades', 'idx_trades_entry_time', 'entry_time');
-
-    // Equity units mode columns
-    await addColumn('trades', 'qty_input', 'DECIMAL(10, 2) DEFAULT NULL');
-    await addColumn('trades', 'actual_qty', 'DECIMAL(10, 2) DEFAULT NULL');
-    await addColumn('trades', 'lot_size_at_entry', 'INT DEFAULT 1');
-    await addColumn('trades', 'trade_mode', "VARCHAR(10) DEFAULT 'LOTS'");
-    await addColumn('trades', 'turnover', 'DECIMAL(15, 2) DEFAULT 0');
-    await addColumn('trades', 'leverage_used', 'DECIMAL(5, 2) DEFAULT 1');
-    await addColumn('trades', 'equity_units_mode', 'TINYINT(1) DEFAULT 0');
 
     await addColumn('scrip_data', 'market_type', "ENUM('MCX','NSE','NFO','EQUITY','COMEX','FOREX','CRYPTO','COMMODITY') DEFAULT 'MCX' AFTER margin_req");
     await addColumn('scrip_data', 'expiry_date', "DATE DEFAULT NULL AFTER market_type");
@@ -586,7 +576,7 @@ const runMigrations = async () => {
 
     // Add contract_mode column
     await addColumn('expiry_rules', 'contract_mode', "VARCHAR(20) DEFAULT 'MANUAL'");
-
+    
     // Add Weekly Settlement Configuration columns (Configurable by SuperAdmin)
     await addColumn('expiry_rules', 'weekly_settlement_day', "VARCHAR(50) DEFAULT 'Sunday'");
     await addColumn('expiry_rules', 'weekly_settlement_time', "VARCHAR(50) DEFAULT '12:00'");
@@ -751,37 +741,39 @@ const runMigrations = async () => {
 
     // ─── 12. DATA MIGRATIONS ───────────────────────────────────────────────────
 
-    // Ensure initial backfill only runs once on legacy setup (avoids 6M row cross-join with large userbases)
-    const [migCheck] = await db.execute("SELECT id FROM db_migrations_log WHERE name = 'initial_user_segments_settings_backfill'");
-    if (migCheck.length === 0) {
-        await db.execute(`
-            INSERT IGNORE INTO user_documents (user_id, kyc_status)
-            SELECT id, 'VERIFIED' FROM users WHERE role = 'TRADER' AND id <= 1000
-        `);
-        await db.execute(`
-            INSERT IGNORE INTO client_settings (user_id)
-            SELECT id FROM users WHERE id <= 1000
-        `);
-        await db.execute(`
-            INSERT IGNORE INTO broker_shares (user_id)
-            SELECT id FROM users WHERE role IN ('BROKER', 'ADMIN')
-        `);
-        await db.execute(`
-            INSERT IGNORE INTO user_segments (user_id, segment)
-            SELECT u.id, s.segment
-            FROM users u
-            CROSS JOIN (
-                SELECT 'MCX'     AS segment UNION ALL
-                SELECT 'EQUITY'  UNION ALL
-                SELECT 'OPTIONS' UNION ALL
-                SELECT 'COMEX'   UNION ALL
-                SELECT 'FOREX'   UNION ALL
-                SELECT 'CRYPTO'
-            ) s
-            WHERE u.id <= 1000
-        `);
-        await db.execute("INSERT IGNORE INTO db_migrations_log (name) VALUES ('initial_user_segments_settings_backfill')");
-    }
+    // Ensure every existing TRADER has a user_documents row (kyc_status = VERIFIED
+    // for pre-existing traders so they can still log in after KYC check was added)
+    await db.execute(`
+        INSERT IGNORE INTO user_documents (user_id, kyc_status)
+        SELECT id, 'VERIFIED' FROM users WHERE role = 'TRADER'
+    `);
+
+    // Ensure every existing user has a client_settings row
+    await db.execute(`
+        INSERT IGNORE INTO client_settings (user_id)
+        SELECT id FROM users
+    `);
+
+    // Ensure every existing BROKER/ADMIN has a broker_shares row
+    await db.execute(`
+        INSERT IGNORE INTO broker_shares (user_id)
+        SELECT id FROM users WHERE role IN ('BROKER', 'ADMIN')
+    `);
+
+    // Ensure every existing user has 6 user_segments rows
+    await db.execute(`
+        INSERT IGNORE INTO user_segments (user_id, segment)
+        SELECT u.id, s.segment
+        FROM users u
+        CROSS JOIN (
+            SELECT 'MCX'     AS segment UNION ALL
+            SELECT 'EQUITY'  UNION ALL
+            SELECT 'OPTIONS' UNION ALL
+            SELECT 'COMEX'   UNION ALL
+            SELECT 'FOREX'   UNION ALL
+            SELECT 'CRYPTO'
+        ) s
+    `);
 
     // ─── 13. VOICE RECORDINGS ──────────────────────────────────────────────────
 
@@ -1198,12 +1190,15 @@ const runMigrations = async () => {
     await addIndex('users', 'idx_users_role', 'role');
     await addIndex('users', 'idx_users_status', 'status');
     await addIndex('users', 'idx_users_role_status', 'role, status');
+    await addIndex('users', 'idx_users_role_parent_id_desc', 'role, parent_id, id DESC');
 
     // Trades table indexes
     await addIndex('trades', 'idx_trades_user_id', 'user_id');
     await addIndex('trades', 'idx_trades_status', 'status');
     await addIndex('trades', 'idx_trades_entry_time', 'entry_time');
     await addIndex('trades', 'idx_trades_user_status', 'user_id, status');
+    await addIndex('trades', 'idx_trades_status_exit', 'status, exit_time');
+    await addIndex('trades', 'idx_trades_trade_ip', 'trade_ip, id');
     await addIndex('trades', 'idx_trades_symbol', 'symbol');
     await addIndex('trades', 'idx_trades_created_by', 'created_by');
 
@@ -1291,20 +1286,20 @@ const runMigrations = async () => {
             console.log('🕐 Running one-time UTC → IST timestamp migration (+330 minutes)...');
 
             const tablesToMigrate = [
-                { table: 'trades', cols: ['entry_time', 'exit_time'] },
+                { table: 'trades',              cols: ['entry_time', 'exit_time'] },
                 { table: 'scrip_ticks_history', cols: ['exchange_time', 'system_time', 'created_at'] },
-                { table: 'notifications', cols: ['created_at'] },
-                { table: 'ip_logins', cols: ['timestamp'] },
-                { table: 'ip_logs', cols: ['timestamp'] },
-                { table: 'ledger', cols: ['created_at'] },
-                { table: 'payment_requests', cols: ['created_at'] },
-                { table: 'action_ledger', cols: ['timestamp'] },
-                { table: 'voice_recordings', cols: ['created_at'] },
-                { table: 'alerts', cols: ['triggered_at', 'created_at'] },
-                { table: 'support_tickets', cols: ['created_at'] },
-                { table: 'ticket_messages', cols: ['created_at'] },
-                { table: 'weekly_balances', cols: ['created_at'] },
-                { table: 'internal_transfers', cols: ['created_at'] },
+                { table: 'notifications',       cols: ['created_at'] },
+                { table: 'ip_logins',           cols: ['timestamp'] },
+                { table: 'ip_logs',             cols: ['timestamp'] },
+                { table: 'ledger',              cols: ['created_at'] },
+                { table: 'payment_requests',    cols: ['created_at'] },
+                { table: 'action_ledger',       cols: ['timestamp'] },
+                { table: 'voice_recordings',    cols: ['created_at'] },
+                { table: 'alerts',              cols: ['triggered_at', 'created_at'] },
+                { table: 'support_tickets',     cols: ['created_at'] },
+                { table: 'ticket_messages',     cols: ['created_at'] },
+                { table: 'weekly_balances',     cols: ['created_at'] },
+                { table: 'internal_transfers',  cols: ['created_at'] },
             ];
 
             for (const { table, cols } of tablesToMigrate) {
@@ -1345,30 +1340,6 @@ const runMigrations = async () => {
         }
     } catch (err) {
         console.error('⚠️ UTC → IST migration error:', err.message);
-    }
-
-    // ─── ENSURE LEDGER TABLE AND INDEXES ──────────────────────────────────
-    try {
-        await db.execute(`
-            CREATE TABLE IF NOT EXISTS ledger (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                user_id INT NOT NULL,
-                amount DECIMAL(18,4) NOT NULL,
-                type VARCHAR(50) NOT NULL,
-                balance_after DECIMAL(18,4) NOT NULL,
-                remarks TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                KEY idx_ledger_user_id (user_id),
-                KEY idx_ledger_created_at (created_at),
-                KEY idx_ledger_type (type)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        `);
-        await addIndex('ledger', 'idx_ledger_user_id', 'user_id');
-        await addIndex('ledger', 'idx_ledger_created_at', 'created_at');
-        await addIndex('ledger', 'idx_ledger_type', 'type');
-        await addIndex('users', 'idx_users_parent_id', 'parent_id');
-    } catch (ledgerIdxErr) {
-        console.error('⚠️ Failed to verify ledger table/indexes:', ledgerIdxErr.message);
     }
 
     console.log('✅ DB migrations complete\n');

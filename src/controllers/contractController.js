@@ -223,12 +223,9 @@ exports.getAllContracts = async (req, res) => {
 exports.getSelectedContracts = async (req, res) => {
     try {
         if (!kiteService.isAuthenticated()) {
-            return res.json({
-                status: 'success',
-                message: 'Kite not connected.',
-                count: 0,
-                data: [],
-                kite_connected: false
+            return res.status(403).json({
+                status: 'error',
+                message: 'Kite not connected.'
             });
         }
         const { hideSet } = await getUserBannedScripsStatus(req.user?.id, req.user?.role);

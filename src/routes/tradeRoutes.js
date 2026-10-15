@@ -1,10 +1,11 @@
 const express = require('express');
 const router = express.Router();
-const { placeOrder, getTrades, getTradeById, getGroupTrades, getActivePositions, closeTrade, deleteTrade, updateTrade, restoreTrade, modifyPendingOrder, setTargetSL, completePendingOrder } = require('../controllers/tradeController');
+const { placeOrder, getTrades, getTradeById, getGroupTrades, getActivePositions, getActivePositionDetails, closeTrade, deleteTrade, updateTrade, restoreTrade, modifyPendingOrder, setTargetSL, completePendingOrder } = require('../controllers/tradeController');
 const { authMiddleware, roleMiddleware, brokerPermission } = require('../middleware/auth');
 
 router.get('/health', (req, res) => res.json({ status: 'OK', message: 'Trade routes active' }));
 router.get('/group', authMiddleware, getGroupTrades);
+router.get('/active/details', authMiddleware, getActivePositionDetails);
 router.get('/active', authMiddleware, getActivePositions);
 router.get('/closed', authMiddleware, getTrades);
 

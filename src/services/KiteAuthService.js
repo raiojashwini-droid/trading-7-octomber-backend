@@ -51,30 +51,21 @@ class KiteAuthService {
         }
     }
 
+    _isUsableSession(session) {
+        if (!session || !session.access_token || !session.saved_at) return false;
+        if (getIstDateStr(session.saved_at) !== getIstDateStr()) return false;
+        return kiteRepo.sessionMatchesEnv(session);
+    }
+
     async getKiteInstance(userId) {
         let session = await kiteRepo.getSessionByUserId(userId);
-        let isValid = false;
-
-        if (session && session.access_token && session.saved_at) {
-            const savedDate = getIstDateStr(session.saved_at);
-            const today = getIstDateStr();
-            if (savedDate === today) isValid = true;
-        }
 
         // Fallback to latest global/platform session if per-user session is not active
-        if (!isValid) {
-            const latestSession = await kiteRepo.getLatestSession();
-            if (latestSession && latestSession.access_token && latestSession.saved_at) {
-                const savedDate = getIstDateStr(latestSession.saved_at);
-                const today = getIstDateStr();
-                if (savedDate === today) {
-                    session = latestSession;
-                    isValid = true;
-                }
-            }
+        if (!this._isUsableSession(session)) {
+            session = await kiteRepo.getLatestSession();
         }
 
-        if (!isValid || !session || !session.access_token) {
+        if (!this._isUsableSession(session)) {
             throw new Error('Kite session expired. Please login again.');
         }
 
@@ -86,30 +77,13 @@ class KiteAuthService {
     async getStatus(userId) {
         try {
             let session = await kiteRepo.getSessionByUserId(userId);
-            let isConnected = false;
-
-            if (session && session.saved_at) {
-                const savedDate = getIstDateStr(session.saved_at);
-                const today = getIstDateStr();
-                if (savedDate === today) {
-                    isConnected = true;
-                }
-            }
 
             // Fallback to latest global/platform session if per-user session is not active
-            if (!isConnected) {
-                const latestSession = await kiteRepo.getLatestSession();
-                if (latestSession && latestSession.saved_at) {
-                    const savedDate = getIstDateStr(latestSession.saved_at);
-                    const today = getIstDateStr();
-                    if (savedDate === today) {
-                        session = latestSession;
-                        isConnected = true;
-                    }
-                }
+            if (!this._isUsableSession(session)) {
+                session = await kiteRepo.getLatestSession();
             }
 
-            if (!isConnected || !session) return { connected: false };
+            if (!this._isUsableSession(session)) return { connected: false };
 
             return {
                 connected: true,
@@ -141,22 +115,19 @@ class KiteAuthService {
         return profile;
     }
 
-    // Save token to DB without re-validating (used when already validated by kiteService)
+    // Save token to DB without re-validating (used when already validated by kiteService).
+    // Always rewrites Zerodha identity so a new .env account replaces the previous row.
     async saveTokenToDB(userId, accessToken, profile = {}) {
-        let session = await kiteRepo.getSessionByUserId(userId);
+        const existing = await kiteRepo.getSessionByUserId(userId);
 
-        if (!session) {
-            await kiteRepo.saveSession(userId, {
-                api_key: API_KEY,
-                access_token: accessToken,
-                public_token: null,
-                user_id: profile.user_id || null,
-                user_name: profile.user_name || 'Unknown',
-                email: profile.email || null
-            });
-        } else {
-            await kiteRepo.updateAccessToken(userId, accessToken);
-        }
+        await kiteRepo.saveSession(userId, {
+            api_key: API_KEY || existing?.api_key || null,
+            access_token: accessToken,
+            public_token: profile.public_token || existing?.public_token || null,
+            user_id: profile.user_id || existing?.kite_user_id || null,
+            user_name: profile.user_name || existing?.user_name || 'Unknown',
+            email: profile.email || existing?.email || null
+        });
     }
 
     async disconnect(userId) {

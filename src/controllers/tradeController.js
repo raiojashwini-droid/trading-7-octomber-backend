@@ -2,7 +2,9 @@ const db = require('../config/db');
 const { logAction } = require('./systemController');
 const mockEngine = require('../utils/mockEngine');
 const bcrypt = require('bcryptjs');
-const { invalidateCache } = require('../utils/cacheManager');
+const { invalidateCache, getGeneration, getFromCache, saveToCache } = require('../utils/cacheManager');
+const { getExact } = require('../utils/exactResultCache');
+const { isCalendarDay, startOfDay, nextDayStart } = require('../utils/dateRange');
 const { getMcxBaseScrip, getLotSize } = require('../utils/symbolHelper');
 const { buildTradeLog } = require('../utils/logFormatter');
 const MarginService = require('../services/MarginService');
@@ -10,6 +12,41 @@ const tradeService = require('../services/TradeService');
 const { getSegmentExposure, isOptionsSymbol } = require('../utils/segmentHelper');
 const { isScripBannedForUser } = require('../utils/bannedHelper');
 const { extractClientIp } = require('../utils/ipHelper');
+
+async function cachedCount(gen, sql, params = []) {
+    const redisKey = `count_${gen}_${Buffer.from(sql + JSON.stringify(params)).toString('base64').slice(0, 80)}`;
+    try {
+        const cached = await getFromCache(redisKey);
+        if (cached !== null && cached !== undefined) return Number(cached);
+    } catch (_) {}
+
+    return getExact(gen, `count\n${sql}\n${JSON.stringify(params)}`, async () => {
+        const [rows] = await db.query(sql, params);
+        const val = Number(rows[0]?.cnt || 0);
+        try { await saveToCache(redisKey, val, 300); } catch (_) {}
+        return val;
+    });
+}
+
+function dayPredicate(columnExpr, fromDate, toDate) {
+    const parts = [];
+    const params = [];
+    if (fromDate && isCalendarDay(fromDate)) {
+        parts.push(`${columnExpr} >= ?`);
+        params.push(startOfDay(fromDate));
+    } else if (fromDate) {
+        parts.push(`DATE(${columnExpr}) >= ?`);
+        params.push(fromDate);
+    }
+    if (toDate && isCalendarDay(toDate)) {
+        parts.push(`${columnExpr} < ?`);
+        params.push(nextDayStart(toDate));
+    } else if (toDate) {
+        parts.push(`DATE(${columnExpr}) <= ?`);
+        params.push(toDate);
+    }
+    return { sql: parts.length ? ` AND ${parts.join(' AND ')}` : '', params };
+}
 
 const syncPaperPosition = async (userId, symbol, connection = db) => {
     try {
@@ -1756,14 +1793,14 @@ const getActivePositions = async (req, res) => {
 
         // Build hierarchy-aware query for OPEN, non-pending trades
         let query = `
-            SELECT SQL_CALC_FOUND_ROWS
+            SELECT
                 t.symbol,
                 t.type,
                 t.market_type,
                 SUM(t.actual_qty) AS total_qty,
                 SUM(COALESCE(t.qty_input, t.qty, 0)) AS total_lots,
                 AVG(t.entry_price) AS avg_price,
-                MAX(COALESCE(t.lot_size_at_entry, st.lot_size, cfl.lot_size, sd.lot_size, 1)) AS lot_size,
+                MAX(t.lot_size_at_entry) AS lot_size,
                 MAX(t.equity_units_mode) AS equity_units_mode,
                 MAX(t.trade_mode) AS trade_mode,
                 SUM(CASE WHEN t.status = 'HOLD' OR t.is_carried_forward = 1 THEN COALESCE(t.qty_input, t.qty, 0) ELSE 0 END) AS hold_lots,
@@ -1772,12 +1809,6 @@ const getActivePositions = async (req, res) => {
                 MAX(t.is_carried_forward) AS is_carried_forward,
                 COUNT(*) AS trade_count
             FROM trades t
-            LEFT JOIN script_testing st
-                ON UPPER(t.symbol) = CONCAT('NFO:', UPPER(st.tradingsymbol))
-                OR UPPER(t.symbol) = UPPER(st.tradingsymbol)
-            LEFT JOIN commodity_forex_crypto_lot_sizes cfl
-                ON UPPER(t.symbol) COLLATE utf8mb4_unicode_ci = UPPER(cfl.symbol) COLLATE utf8mb4_unicode_ci
-            LEFT JOIN scrip_data sd ON t.symbol = sd.symbol
             WHERE t.status IN ('OPEN', 'HOLD')
               AND t.is_pending = 0
         `;
@@ -1789,7 +1820,7 @@ const getActivePositions = async (req, res) => {
             params.push(id);
         } else {
             // Exclude demo users for all non-trader roles
-            query += ` AND t.user_id IN (SELECT id FROM users WHERE is_demo = 0)`;
+            query += ` AND EXISTS (SELECT 1 FROM users du WHERE du.id = t.user_id AND du.is_demo = 0)`;
             if (role === 'SUPERADMIN') {
                 // Superadmins see all active positions (no restriction filter needed)
             } else if (role === 'ADMIN') {
@@ -1811,27 +1842,33 @@ const getActivePositions = async (req, res) => {
 
         query += ` GROUP BY t.symbol, t.type, t.market_type ORDER BY t.symbol ASC`;
 
-        // Optional server-side pagination (backward-compatible)
-        const page = parseInt(req.query.page, 10) || 1;
-        const limit = parseInt(req.query.limit, 10) || null;
-        if (limit && limit > 0) {
-            const offset = (page - 1) * limit;
-            query += ' LIMIT ? OFFSET ?';
-            params.push(limit, offset);
-        }
-
         const [rows] = await db.execute(query, params);
-
-        let totalPositionsCount = rows.length;
-        if (limit && limit > 0) {
-            try {
-                const [foundRows] = await db.execute('SELECT FOUND_ROWS() as total');
-                totalPositionsCount = parseInt(foundRows[0]?.total, 10) || rows.length;
-            } catch (e) {
-                totalPositionsCount = rows.length;
-            }
+        const missingLotSymbols = [...new Set(rows.filter(row => row.lot_size == null && row.symbol).map(row => row.symbol))];
+        if (missingLotSymbols.length) {
+            const bare = missingLotSymbols.map(symbol => String(symbol).split(':').pop().toUpperCase());
+            const marks = bare.map(() => '?').join(',');
+            const [stRows] = await db.query(
+                `SELECT tradingsymbol, lot_size FROM script_testing WHERE UPPER(tradingsymbol) IN (${marks})`,
+                bare
+            );
+            const [cflRows] = await db.query(
+                `SELECT symbol, lot_size FROM commodity_forex_crypto_lot_sizes WHERE UPPER(symbol) IN (${marks})`,
+                bare
+            );
+            const [sdRows] = await db.query(
+                `SELECT symbol, lot_size FROM scrip_data WHERE symbol IN (${missingLotSymbols.map(() => '?').join(',')})`,
+                missingLotSymbols
+            );
+            const lotByBare = new Map();
+            sdRows.forEach(row => lotByBare.set(String(row.symbol).split(':').pop().toUpperCase(), row.lot_size));
+            cflRows.forEach(row => lotByBare.set(String(row.symbol).toUpperCase(), row.lot_size));
+            stRows.forEach(row => lotByBare.set(String(row.tradingsymbol).toUpperCase(), row.lot_size));
+            rows.forEach(row => {
+                if (row.lot_size != null) return;
+                const bareSymbol = String(row.symbol).split(':').pop().toUpperCase();
+                row.lot_size = lotByBare.get(bareSymbol) || lotByBare.get(String(row.symbol).toUpperCase()) || 1;
+            });
         }
-
         const commodityLotService = require('../services/CommodityLotService');
         const { MCX_LOT_SIZES } = require('../utils/symbolHelper');
 
@@ -1878,14 +1915,92 @@ const getActivePositions = async (req, res) => {
                 }
             }
         });
-
-        if (limit && limit > 0) {
-            res.json({ data: rows, total: totalPositionsCount, page, limit });
-        } else {
-            res.json(rows);
-        }
+        res.json(rows);
     } catch (err) {
         console.error('[getActivePositions] Error:', err);
+        res.status(500).json({ message: 'Server Error', error: err.message });
+    }
+};
+
+const getActivePositionDetails = async (req, res) => {
+    try {
+        const symbol = req.query.symbol || req.query.scrip;
+        if (!symbol) return res.json([]);
+        const { id, role } = req.user;
+        let query = `
+            SELECT t.user_id,
+                   u.username,
+                   u.full_name,
+                   CASE WHEN t.status = 'HOLD' OR t.is_carried_forward = 1 THEN 'HOLD' ELSE 'OPEN' END AS pos_status,
+                   MAX(COALESCE(t.lot_size_at_entry, 1)) AS lot_size,
+                   SUM(CASE WHEN t.type = 'BUY' THEN COALESCE(t.qty_input, t.qty, 0) ELSE 0 END) AS active_buy_lots,
+                   SUM(CASE WHEN t.type = 'SELL' THEN COALESCE(t.qty_input, t.qty, 0) ELSE 0 END) AS active_sell_lots,
+                   SUM(CASE WHEN t.type = 'BUY' THEN COALESCE(t.actual_qty, t.qty, 0) ELSE 0 END) AS active_buy,
+                   SUM(CASE WHEN t.type = 'SELL' THEN COALESCE(t.actual_qty, t.qty, 0) ELSE 0 END) AS active_sell,
+                   SUM(COALESCE(t.entry_price, 0) * COALESCE(t.actual_qty, t.qty, 0)) AS total_value,
+                   SUM(COALESCE(t.actual_qty, t.qty, 0)) AS total_qty_for_avg,
+                   MAX(t.id) AS newest_id
+            FROM trades t
+            JOIN users u ON t.user_id = u.id
+            WHERE t.symbol = ?
+              AND t.status IN ('OPEN', 'HOLD')
+              AND t.is_pending = 0
+        `;
+        const params = [symbol];
+        if (role === 'TRADER') {
+            query += ' AND t.user_id = ?';
+            params.push(id);
+        } else {
+            query += ' AND u.is_demo = 0';
+            if (role === 'ADMIN') {
+                query += ` AND (t.created_by = ? OR t.user_id IN (
+                    SELECT u2.id FROM users u2
+                    LEFT JOIN client_settings cs ON u2.id = cs.user_id
+                    WHERE u2.parent_id = ? OR cs.broker_id IN (SELECT id FROM users WHERE parent_id = ?)
+                ))`;
+                params.push(id, id, id);
+            } else if (role === 'BROKER') {
+                query += ` AND (t.created_by = ? OR t.user_id IN (
+                    SELECT u2.id FROM users u2
+                    LEFT JOIN client_settings cs ON u2.id = cs.user_id
+                    WHERE u2.parent_id = ? OR cs.broker_id = ?
+                ))`;
+                params.push(id, id, id);
+            }
+        }
+        query += `
+            GROUP BY t.user_id, u.username, u.full_name,
+                     CASE WHEN t.status = 'HOLD' OR t.is_carried_forward = 1 THEN 'HOLD' ELSE 'OPEN' END
+            ORDER BY newest_id DESC`;
+        const [rows] = await db.query(query, params);
+        res.json(rows.map(row => {
+            const activeBuyLots = parseFloat(row.active_buy_lots) || 0;
+            const activeSellLots = parseFloat(row.active_sell_lots) || 0;
+            const activeBuy = parseFloat(row.active_buy) || 0;
+            const activeSell = parseFloat(row.active_sell) || 0;
+            const totalValue = parseFloat(row.total_value) || 0;
+            const totalQtyForAvg = parseFloat(row.total_qty_for_avg) || 0;
+            const status = row.pos_status;
+            return {
+                key: `${row.user_id}_${status}`,
+                userId: row.user_id,
+                username: row.username || 'N/A',
+                fullName: row.full_name || 'N/A',
+                status,
+                lotSize: parseFloat(row.lot_size || 1),
+                activeBuyLots,
+                activeSellLots,
+                activeBuy,
+                activeSell,
+                totalValue,
+                totalQtyForAvg,
+                avgPrice: totalQtyForAvg > 0 ? (totalValue / totalQtyForAvg) : 0,
+                overallActiveLots: activeBuyLots - activeSellLots,
+                overallActive: activeBuy - activeSell
+            };
+        }));
+    } catch (err) {
+        console.error('[getActivePositionDetails] Error:', err);
         res.status(500).json({ message: 'Server Error', error: err.message });
     }
 };
@@ -1897,61 +2012,87 @@ const getTrades = async (req, res) => {
     const { status } = req.query; // OPEN, CLOSED, DELETED, CANCELLED
     const targetUserId = req.query.user_id || req.query.userId || req.query.clientId;
     try {
-        // ── OPTIMISED QUERY: removed 3 non-indexed LEFT JOINs ──
-        // script_testing, commodity_forex_crypto_lot_sizes, scrip_data all used
-        // UPPER()/REPLACE()/COLLATE on every row → full-table function scans = timeouts.
-        // lot_size is resolved after the query via commodityLotService (already done below).
-        // trades.lot_size_at_entry is saved at trade creation and is sufficient for display.
-        const whereClauses = ['1=1'];
+        // lot_size priority:
+        //   1. trades.lot_size_at_entry  → saved at trade creation (most accurate)
+        //   2. script_testing.lot_size   → NFO FUT/OPT live from Zerodha API
+        //   3. commodity_forex_crypto_lot_sizes.lot_size → COMEX / FOREX / CRYPTO
+        //   4. scrip_data.lot_size       → fallback legacy
+        //   MCX lot sizes are handled on frontend via hardcoded MCX_LOT_SIZES table
+        let query = `SELECT t.*,
+            u.username, u.full_name,
+            uc.username as created_by_name,
+            uc.role as created_by_role,
+            COALESCE(
+                t.lot_size_at_entry,
+                st.lot_size,
+                cfl.lot_size,
+                sd.lot_size
+            ) AS lot_size
+            FROM trades t
+            JOIN users u ON t.user_id = u.id
+            LEFT JOIN users uc ON t.created_by = uc.id
+            LEFT JOIN script_testing st
+                ON UPPER(t.symbol) COLLATE utf8mb4_unicode_ci = CONCAT('NFO:', UPPER(st.tradingsymbol)) COLLATE utf8mb4_unicode_ci
+                OR UPPER(t.symbol) COLLATE utf8mb4_unicode_ci = UPPER(st.tradingsymbol) COLLATE utf8mb4_unicode_ci
+            LEFT JOIN commodity_forex_crypto_lot_sizes cfl
+                ON UPPER(t.symbol) COLLATE utf8mb4_unicode_ci = UPPER(cfl.symbol) COLLATE utf8mb4_unicode_ci
+                OR UPPER(t.symbol) COLLATE utf8mb4_unicode_ci = CONCAT('COMMODITY:', UPPER(cfl.symbol)) COLLATE utf8mb4_unicode_ci
+                OR UPPER(t.symbol) COLLATE utf8mb4_unicode_ci = CONCAT('FOREX:', UPPER(cfl.symbol)) COLLATE utf8mb4_unicode_ci
+                OR UPPER(t.symbol) COLLATE utf8mb4_unicode_ci = CONCAT('CRYPTO:', UPPER(cfl.symbol)) COLLATE utf8mb4_unicode_ci
+                OR REPLACE(REPLACE(REPLACE(REPLACE(UPPER(t.symbol), 'COMMODITY:', ''), 'FOREX:', ''), 'CRYPTO:', ''), '/', '') COLLATE utf8mb4_unicode_ci = REPLACE(UPPER(cfl.symbol), '/', '') COLLATE utf8mb4_unicode_ci
+            LEFT JOIN scrip_data sd ON t.symbol COLLATE utf8mb4_unicode_ci = sd.symbol COLLATE utf8mb4_unicode_ci
+            WHERE 1=1`;
         const params = [];
 
         if (status) {
             if (status === 'OPEN') {
-                whereClauses.push("t.status IN ('OPEN', 'HOLD')");
+                query += " AND t.status IN ('OPEN', 'HOLD')";
             } else if (status === 'CLOSED') {
-                whereClauses.push("t.status IN ('CLOSED', 'SETTLED')");
-                if (req.query.current_week_only === 'true' || req.query.current_week_only === '1') {
+                query += " AND t.status IN ('CLOSED', 'SETTLED')";
+                if (!req.query.fromDate && req.query.include_history !== 'true' && req.query.include_history !== '1') {
                     const { getWeekBoundaries, getISTDate } = require('../services/WeeklySettlementService');
                     const { week_start } = getWeekBoundaries(getISTDate());
-                    whereClauses.push(`COALESCE(t.exit_time, t.entry_time) >= '${week_start} 00:00:00'`);
+                    query += ` AND t.exit_time >= '${week_start} 00:00:00'`;
+                    query += ` AND COALESCE(t.exit_time, t.entry_time) >= COALESCE(u.last_reset_at, '${week_start} 00:00:00')`;
                 }
             } else {
-                whereClauses.push('t.status = ?');
+                query += ' AND t.status = ?';
                 params.push(status);
             }
         } else {
-            whereClauses.push("t.status != 'DELETED'");
+            query += " AND t.status != 'DELETED'";
         }
 
         if (req.query.is_pending !== undefined) {
             const isPending = req.query.is_pending === 'true' || req.query.is_pending === '1' ? 1 : 0;
-            whereClauses.push('t.is_pending = ?');
+            query += ' AND t.is_pending = ?';
             params.push(isPending);
             // Pending orders list should only show active (OPEN) ones, not cancelled
             if (isPending === 1 && !status) {
-                whereClauses.push("t.status = 'OPEN'");
+                query += " AND t.status = 'OPEN'";
             }
         }
 
         if (req.query.current_week_only === 'true' || req.query.current_week_only === '1' || req.query.currentWeekOnly === 'true') {
             const { getWeekBoundaries, getISTDate } = require('../services/WeeklySettlementService');
             const { week_start } = getWeekBoundaries(getISTDate());
-            whereClauses.push(`COALESCE(t.exit_time, t.entry_time) >= COALESCE(u.last_reset_at, '${week_start} 00:00:00')`);
+            query += ` AND t.exit_time >= '${week_start} 00:00:00'`;
+            query += ` AND COALESCE(t.exit_time, t.entry_time) >= COALESCE(u.last_reset_at, '${week_start} 00:00:00')`;
         }
 
         // Filter by specific trade ID
         if (req.query.id) {
-            whereClauses.push('t.id = ?');
+            query += ' AND t.id = ?';
             params.push(req.query.id);
         }
 
         // Filter by specific user_id (for client detail views)
         if (targetUserId) {
-            whereClauses.push('t.user_id = ?');
+            query += ' AND t.user_id = ?';
             params.push(targetUserId);
-        } else if (!req.query.id && req.user.role !== 'TRADER' && req.user.role !== 'SUPERADMIN' && req.query.include_demo !== 'true') {
+        } else if (!req.query.id && req.user.role !== 'TRADER') {
             // Exclude demo trades for overall lists viewed by admin/broker
-            whereClauses.push('COALESCE(u.is_demo, 0) = 0');
+            query += ' AND u.is_demo = 0';
         }
 
         // Role-based visibility isolation (consistent for both global list and client detail view)
@@ -1959,35 +2100,35 @@ const getTrades = async (req, res) => {
             // Superadmins can see all trades in the system
         } else if (req.user.role === 'ADMIN') {
             // Admins see their own created trades OR trades of their descendants (clients and brokers under them)
-            whereClauses.push(`(t.created_by = ? OR t.user_id IN (
+            query += ` AND (t.created_by = ? OR t.user_id IN (
                 SELECT u.id FROM users u 
                 LEFT JOIN client_settings cs ON u.id = cs.user_id
                 WHERE u.parent_id = ? OR cs.broker_id IN (SELECT id FROM users WHERE parent_id = ?)
-            ))`);
+            ))`;
             params.push(req.user.id, req.user.id, req.user.id);
         } else if (req.user.role === 'BROKER') {
             // Brokers see trades they created OR trades of their clients/sub-brokers
-            whereClauses.push(`(t.created_by = ? OR t.user_id IN (
+            query += ` AND (t.created_by = ? OR t.user_id IN (
                 SELECT u.id FROM users u 
                 LEFT JOIN client_settings cs ON u.id = cs.user_id 
                 WHERE u.parent_id = ? OR cs.broker_id = ?
-            ))`);
+            ))`;
             params.push(req.user.id, req.user.id, req.user.id);
         } else {
             // TRADER sees only their own trades
-            whereClauses.push('t.user_id = ?');
+            query += ' AND t.user_id = ?';
             params.push(req.user.id);
         }
 
         // Filter by username
         if (req.query.username) {
-            whereClauses.push('u.username LIKE ?');
+            query += ' AND u.username LIKE ?';
             params.push(`%${req.query.username}%`);
         }
 
         // Filter by scrip (symbol)
         if (req.query.scrip) {
-            whereClauses.push('t.symbol LIKE ?');
+            query += ' AND t.symbol LIKE ?';
             params.push(`%${req.query.scrip}%`);
         }
 
@@ -1995,157 +2136,278 @@ const getTrades = async (req, res) => {
         if (req.query.current_week_only === 'true' || req.query.current_week_only === '1') {
             const { getWeekBoundaries, getISTDate } = require('../services/WeeklySettlementService');
             const boundaries = getWeekBoundaries(getISTDate());
-            whereClauses.push('t.entry_time >= ?');
+            query += ' AND t.entry_time >= ?';
             params.push(boundaries.week_start + ' 00:00:00');
         }
 
         // Filter by date range
-        if (req.query.fromDate) {
-            whereClauses.push('DATE(COALESCE(t.exit_time, t.entry_time)) >= ?');
-            params.push(req.query.fromDate);
-        }
-        if (req.query.toDate) {
-            whereClauses.push('DATE(COALESCE(t.exit_time, t.entry_time)) <= ?');
-            params.push(req.query.toDate);
-        }
+        const tradeDay = dayPredicate('COALESCE(t.exit_time, t.entry_time)', req.query.fromDate, req.query.toDate);
+        query += tradeDay.sql;
+        params.push(...tradeDay.params);
 
-        // Filter by segment (MCX, NSE, CRYPTO, FOREX)
-        if (req.query.segment && req.query.segment !== 'All') {
-            const seg = req.query.segment.toUpperCase();
+        if (req.query.segment && String(req.query.segment).toUpperCase() !== 'ALL') {
+            const seg = String(req.query.segment).toUpperCase();
+            const mcxNames = ['GOLD', 'GOLDM', 'SILVER', 'SILVERM', 'CRUDEOIL', 'COPPER', 'NICKEL', 'ZINC', 'LEAD', 'ALUMINIUM', 'NATURALGAS'];
             if (seg === 'MCX') {
-                whereClauses.push("(t.market_type = 'MCX' OR t.symbol LIKE 'MCX:%' OR t.symbol REGEXP 'GOLD|SILVER|CRUDEOIL|COPPER|NICKEL|ZINC|LEAD|ALUMINIUM|NATURALGAS')");
-            } else if (seg === 'NSE' || seg === 'EQUITY') {
-                whereClauses.push("(t.market_type IN ('NSE', 'EQUITY', 'OPTIONS', 'NFO') AND t.symbol NOT LIKE 'MCX:%' AND t.symbol NOT LIKE 'CRYPTO:%' AND t.symbol NOT LIKE 'FOREX:%' AND t.symbol NOT REGEXP 'GOLD|SILVER|CRUDEOIL|COPPER|NICKEL|ZINC|LEAD|ALUMINIUM|NATURALGAS')");
+                query += ` AND (UPPER(IFNULL(t.market_type,'')) = 'MCX' OR ${mcxNames.map(() => 'UPPER(t.symbol) LIKE ?').join(' OR ')})`;
+                mcxNames.forEach(n => params.push(`%${n}%`));
             } else if (seg === 'CRYPTO') {
-                whereClauses.push("(t.market_type = 'CRYPTO' OR t.symbol LIKE 'CRYPTO:%')");
+                query += ` AND (UPPER(IFNULL(t.market_type,'')) = 'CRYPTO' OR UPPER(t.symbol) LIKE 'CRYPTO:%')`;
             } else if (seg === 'FOREX') {
-                whereClauses.push("(t.market_type = 'FOREX' OR t.symbol LIKE 'FOREX:%')");
+                query += ` AND (UPPER(IFNULL(t.market_type,'')) = 'FOREX' OR UPPER(t.symbol) LIKE 'FOREX:%')`;
+            } else if (seg === 'NSE') {
+                query += ` AND UPPER(IFNULL(t.market_type,'')) NOT IN ('MCX','CRYPTO','FOREX','COMMODITY','COMEX')`;
+                mcxNames.forEach(n => {
+                    query += ' AND UPPER(t.symbol) NOT LIKE ?';
+                    params.push(`%${n}%`);
+                });
             }
         }
 
-        // Optional server-side pagination (backward-compatible: default 50 records, max 100 per page)
-        const page = parseInt(req.query.page, 10) || 1;
-        const requestedLimit = req.query.limit !== undefined && req.query.limit !== null ? parseInt(req.query.limit, 10) : null;
-
-        const isPositionsCall = status === 'OPEN' || req.query.is_pending !== undefined;
-        const MAX_LIMIT = isPositionsCall ? 1000 : 100;
-        let limit = null;
-        if (requestedLimit !== null && !isNaN(requestedLimit) && requestedLimit > 0) {
-            limit = Math.min(requestedLimit, MAX_LIMIT);
-        } else if (req.query.page !== undefined) {
-            limit = 50; // Configurable default page size
-        } else if (!req.query.all) {
-            limit = 50;
-        } else {
-            limit = MAX_LIMIT;
+        const requestedPage = parseInt(req.query.page, 10);
+        const requestedLimit = parseInt(req.query.limit, 10);
+        let pageNum = requestedPage;
+        let limitNum = requestedLimit;
+        let paginate = Number.isFinite(pageNum) && pageNum > 0 && Number.isFinite(limitNum) && limitNum > 0;
+        const statusUpperEarly = status ? String(status).toUpperCase() : null;
+        const heavyUnscoped = !targetUserId && !req.query.id && req.user.role !== 'TRADER'
+            && (!statusUpperEarly || statusUpperEarly === 'CLOSED' || statusUpperEarly === 'DELETED' || statusUpperEarly === 'SETTLED' || statusUpperEarly === 'WEEKLY SETTLED')
+            && !req.query.fromDate && !req.query.toDate && !req.query.scrip;
+        if (!paginate && heavyUnscoped) {
+            paginate = true;
+            pageNum = 1;
+            limitNum = 50;
+        }
+        if (paginate) {
+            limitNum = Math.min(Math.max(parseInt(limitNum, 10) || 50, 1), 100);
+            pageNum = Math.max(parseInt(pageNum, 10) || 1, 1);
         }
 
-        const rawOffset = req.query.offset !== undefined ? parseInt(req.query.offset, 10) : ((page - 1) * (limit || 50));
-        const offset = Math.max(0, isNaN(rawOffset) ? 0 : rawOffset);
+        const whereClause = query.slice(query.indexOf('WHERE 1=1'));
+        const idFrom = `FROM trades t JOIN users u ON t.user_id = u.id ${whereClause}`;
+        const includeWsi = !statusUpperEarly || statusUpperEarly === 'CLOSED' || statusUpperEarly === 'WEEKLY SETTLED' || statusUpperEarly === 'SETTLED';
 
-        // Server-side deterministic sorting with whitelisted columns
-        const validSortColumns = {
-            id: 't.id',
-            symbol: 't.symbol',
-            qty: 't.qty',
-            entry_price: 't.entry_price',
-            exit_price: 't.exit_price',
-            pnl: 't.pnl',
-            brokerage: 't.brokerage',
-            entry_time: 't.entry_time',
-            exit_time: 't.exit_time',
-            username: 'u.username',
-            status: 't.status',
-            type: 't.type'
-        };
-        const sortByParam = req.query.sortBy || req.query.sortField;
-        const sortCol = validSortColumns[sortByParam] || 't.id';
-        const sortDir = (req.query.sortOrder || req.query.sortDirection)?.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
-
-        const whereSQL = whereClauses.join(' AND ');
-        const needsUserJoin = whereSQL.includes('u.') || sortCol.startsWith('u.');
-
-        // Calculate true total count matching filters (with 60s cache for broad queries on 1,000,000+ rows)
-        let trueTotalTrades = 0;
-        if (limit && limit > 0) {
-            const isUnfilteredQuery = !req.query.scrip && !req.query.username && !req.query.id && !req.query.fromDate && !req.query.toDate;
-            const countCacheKey = isUnfilteredQuery ? `trades_count_${req.user.role}_${req.user.id}_${status || 'ALL'}_${req.query.segment || 'ALL'}` : null;
-
-            if (countCacheKey) {
-                try {
-                    const { getFromCache } = require('../utils/cacheManager');
-                    const cachedCount = await getFromCache(countCacheKey);
-                    if (cachedCount !== null && cachedCount !== undefined) {
-                        trueTotalTrades = cachedCount;
-                    }
-                } catch (_) {}
+        const buildWsiIdFrom = () => {
+            let sql = 'FROM weekly_settlement_items wsi JOIN users u ON wsi.user_id = u.id WHERE 1=1';
+            const p = [];
+            if (targetUserId) {
+                sql += ' AND wsi.user_id = ?';
+                p.push(targetUserId);
+            } else if (req.user && req.user.role !== 'TRADER') {
+                sql += ' AND u.is_demo = 0';
             }
-
-            if (!trueTotalTrades) {
-                try {
-                    const countFrom = needsUserJoin ? 'FROM trades t LEFT JOIN users u ON t.user_id = u.id' : 'FROM trades t';
-                    const countQuery = `SELECT COUNT(*) as total ${countFrom} WHERE ${whereSQL}`;
-                    const [countRows] = await db.execute(countQuery, [...params]);
-                    trueTotalTrades = countRows[0]?.total || 0;
-                    if (countCacheKey && trueTotalTrades > 0) {
-                        try {
-                            const { saveToCache } = require('../utils/cacheManager');
-                            await saveToCache(countCacheKey, trueTotalTrades, 60);
-                        } catch (_) {}
-                    }
-                } catch (cErr) {
-                    console.warn('[getTrades] Count query fallback:', cErr.message);
+            if (req.user) {
+                if (req.user.role === 'ADMIN') {
+                    sql += ` AND (wsi.user_id IN (
+                        SELECT u.id FROM users u
+                        LEFT JOIN client_settings cs ON u.id = cs.user_id
+                        WHERE u.parent_id = ? OR cs.broker_id IN (SELECT id FROM users WHERE parent_id = ?)
+                    ))`;
+                    p.push(req.user.id, req.user.id);
+                } else if (req.user.role === 'BROKER') {
+                    sql += ` AND (wsi.user_id IN (
+                        SELECT u.id FROM users u
+                        LEFT JOIN client_settings cs ON u.id = cs.user_id
+                        WHERE u.parent_id = ? OR cs.broker_id = ?
+                    ))`;
+                    p.push(req.user.id, req.user.id);
+                } else if (req.user.role === 'TRADER') {
+                    sql += ' AND wsi.user_id = ?';
+                    p.push(req.user.id);
                 }
             }
-        }
+            if (req.query.scrip) {
+                sql += ' AND wsi.symbol LIKE ?';
+                p.push(`%${req.query.scrip}%`);
+            }
+            if (req.query.username) {
+                sql += ' AND u.username LIKE ?';
+                p.push(`%${req.query.username}%`);
+            }
+            const wsiDay = dayPredicate('wsi.created_at', req.query.fromDate, null);
+            sql += wsiDay.sql;
+            p.push(...wsiDay.params);
+            if (!req.query.fromDate && req.query.include_history !== 'true' && req.query.include_history !== '1') {
+                const { getWeekBoundaries, getISTDate } = require('../services/WeeklySettlementService');
+                const { week_start } = getWeekBoundaries(getISTDate());
+                sql += ` AND wsi.created_at >= COALESCE(u.last_reset_at, '${week_start} 00:00:00')`;
+            }
+            const wsiDayEnd = dayPredicate('wsi.created_at', null, req.query.toDate);
+            sql += wsiDayEnd.sql;
+            p.push(...wsiDayEnd.params);
+            return { sql, p };
+        };
 
-        let mainQuery = '';
-        if (limit && limit > 0) {
-            // DEFERRED JOIN: Scan ONLY primary key `t.id` in subquery for pagination window.
-            // Avoids wide row materialization and joining users on discarded offset rows.
-            // Transforms deep offsets (e.g. offset 999,950) from 7+ seconds into <40ms index lookups on 1,000,000+ rows!
-            const subqueryJoin = needsUserJoin ? 'LEFT JOIN users u ON t.user_id = u.id' : '';
-            mainQuery = `
-                SELECT t.*,
-                    u.username, u.full_name,
-                    uc.username as created_by_name,
-                    uc.role as created_by_role,
-                    t.lot_size_at_entry AS lot_size
-                FROM (
-                    SELECT t.id
-                    FROM trades t
-                    ${subqueryJoin}
-                    WHERE ${whereSQL}
-                    ORDER BY ${sortCol} ${sortDir}, t.id DESC
-                    LIMIT ${limit} OFFSET ${offset}
-                ) AS page_pks
-                JOIN trades t ON t.id = page_pks.id
-                LEFT JOIN users u ON t.user_id = u.id
-                LEFT JOIN users uc ON t.created_by = uc.id
-                ORDER BY ${sortCol} ${sortDir}, t.id DESC
-            `;
+        let pageKeys = null;
+        let totalCount = null;
+        let rows = [];
+
+        const dedupeTrades = (list) => {
+            const seen = new Set();
+            return list.filter(row => {
+                const id = Number(row.id);
+                if (seen.has(id)) return false;
+                seen.add(id);
+                return true;
+            });
+        };
+
+        if (paginate) {
+            const offset = (pageNum - 1) * limitNum;
+            const financialGen = await getGeneration('financial');
+            // Full history has no status filter. Joining every trade to users
+            // and then sorting reads the whole table even when LIMIT is 15.
+            // Walk the primary key from the newest id and stop at this page.
+            const fullHistory = !statusUpperEarly || statusUpperEarly === 'DELETED';
+            const simpleList = !targetUserId && !req.query.username && !req.query.scrip
+                && !req.query.fromDate && !req.query.toDate && !req.query.segment
+                && req.user.role === 'SUPERADMIN';
+            if (fullHistory) {
+                const countSql = (simpleList && statusUpperEarly !== 'DELETED')
+                    ? `SELECT COUNT(*) AS cnt FROM trades WHERE status != 'DELETED'`
+                    : `SELECT COUNT(*) AS cnt ${idFrom}`;
+                const countParams = (simpleList && statusUpperEarly !== 'DELETED') ? [] : params;
+                const pageFrom = (simpleList && statusUpperEarly !== 'DELETED')
+                    ? `FROM trades t USE INDEX (idx_trades_status_id) WHERE t.status != 'DELETED'`
+                    : `FROM trades t USE INDEX (idx_trades_status_id, PRIMARY) JOIN users u ON t.user_id = u.id ${whereClause}`;
+                const pageParams = (simpleList && statusUpperEarly !== 'DELETED') ? [] : params;
+                const [countValue, keyRows] = await Promise.all([
+                    cachedCount(financialGen, countSql, countParams),
+                    db.query(
+                        `SELECT 'T' AS src, t.id AS row_id ${pageFrom} ORDER BY t.id DESC LIMIT ${limitNum} OFFSET ${offset}`,
+                        pageParams
+                    ).then(([rows]) => rows)
+                ]);
+                totalCount = countValue;
+                pageKeys = keyRows;
+            } else if (simpleList && statusUpperEarly === 'CLOSED') {
+                const { getWeekBoundaries, getISTDate } = require('../services/WeeklySettlementService');
+                const { week_start } = getWeekBoundaries(getISTDate());
+                const weekTs = `${week_start} 00:00:00`;
+                const fetchN = offset + limitNum;
+                // Dummy users were counted and filled the early pages, then dropped
+                // after LIMIT, so only the last pages still had real users.
+                const closedFrom = `FROM trades t FORCE INDEX (idx_trades_status_exit) JOIN users u ON u.id = t.user_id AND u.is_demo = 0 WHERE t.status IN ('CLOSED','SETTLED') AND t.exit_time >= ?`;
+                const [countValue, tradeKeyRows] = await Promise.all([
+                    cachedCount(financialGen, `SELECT COUNT(*) AS cnt ${closedFrom}`, [weekTs]),
+                    db.query(
+                        `SELECT 'T' AS src, t.id AS row_id, t.exit_time AS sort_time ${closedFrom} ORDER BY t.exit_time DESC LIMIT ${fetchN}`,
+                        [weekTs]
+                    ).then(([rows]) => rows)
+                ]);
+                totalCount = countValue;
+                let merged = tradeKeyRows;
+                if (includeWsi) {
+                    const wsiFrom = buildWsiIdFrom();
+                    const [wsiCountValue, wsiKeyRows] = await Promise.all([
+                        cachedCount(financialGen, `SELECT COUNT(*) AS cnt ${wsiFrom.sql}`, wsiFrom.p),
+                        db.query(`SELECT 'W' AS src, wsi.id AS row_id, wsi.created_at AS sort_time ${wsiFrom.sql} ORDER BY wsi.created_at DESC LIMIT ${fetchN}`, wsiFrom.p).then(([rows]) => rows)
+                    ]);
+                    totalCount += wsiCountValue;
+                    merged = tradeKeyRows.concat(wsiKeyRows).sort((a, b) => new Date(b.sort_time) - new Date(a.sort_time));
+                }
+                pageKeys = merged.slice(offset, offset + limitNum);
+            } else if (statusUpperEarly === 'OPEN') {
+                const openFrom = `FROM trades t FORCE INDEX (idx_trades_status) JOIN users u ON t.user_id = u.id ${whereClause}`;
+                const [countValue, keyRows] = await Promise.all([
+                    cachedCount(financialGen, `SELECT COUNT(*) AS cnt ${openFrom}`, params),
+                    db.query(
+                        `SELECT 'T' AS src, t.id AS row_id ${openFrom} ORDER BY t.id DESC LIMIT ${limitNum} OFFSET ${offset}`,
+                        params
+                    ).then(([rows]) => rows)
+                ]);
+                totalCount = countValue;
+                pageKeys = keyRows;
+            } else {
+                const closedFrom = `FROM trades t FORCE INDEX (idx_trades_status_exit) JOIN users u ON t.user_id = u.id ${whereClause}`;
+                const fetchN = offset + limitNum;
+                const [countValue, tradeKeyRows] = await Promise.all([
+                    cachedCount(financialGen, `SELECT COUNT(*) AS cnt ${closedFrom}`, params),
+                    db.query(
+                        `SELECT 'T' AS src, t.id AS row_id, COALESCE(t.exit_time, t.entry_time) AS sort_time ${closedFrom} ORDER BY t.exit_time DESC LIMIT ${fetchN}`,
+                        params
+                    ).then(([rows]) => rows)
+                ]);
+                totalCount = countValue;
+                let merged = tradeKeyRows;
+                if (includeWsi) {
+                    const wsiFrom = buildWsiIdFrom();
+                    const [wsiCountValue, wsiKeyRows] = await Promise.all([
+                        cachedCount(financialGen, `SELECT COUNT(*) AS cnt ${wsiFrom.sql}`, wsiFrom.p),
+                        db.query(
+                            `SELECT 'W' AS src, wsi.id AS row_id, wsi.created_at AS sort_time ${wsiFrom.sql} ORDER BY wsi.created_at DESC LIMIT ${fetchN}`,
+                            wsiFrom.p
+                        ).then(([found]) => found)
+                    ]);
+                    totalCount += wsiCountValue;
+                    merged = tradeKeyRows.concat(wsiKeyRows).sort((a, b) => new Date(b.sort_time) - new Date(a.sort_time));
+                }
+                pageKeys = merged.slice(offset, offset + limitNum);
+            }
+            const tradeIds = pageKeys
+                .filter(k => String(k.src).trim() === 'T')
+                .map(k => Number(k.row_id))
+                .filter(id => Number.isInteger(id) && id > 0);
+            if (tradeIds.length) {
+                // Page rows are already chosen. Hydrate those ids only.
+                // The list query's symbol joins scan lot-size tables and turn a
+                // 15-row page into a multi-second request.
+                const [hydrated] = await db.query(
+                    `SELECT t.*,
+                            u.username, u.full_name, u.is_demo,
+                            uc.username AS created_by_name,
+                            uc.role AS created_by_role
+                     FROM trades t
+                     JOIN users u ON t.user_id = u.id
+                     LEFT JOIN users uc ON t.created_by = uc.id
+                     WHERE t.id IN (${tradeIds.join(',')})`
+                );
+                const missingLot = hydrated.filter(trade => trade.lot_size_at_entry == null && trade.symbol);
+                const lotBySymbol = new Map();
+                if (missingLot.length) {
+                    const bare = [...new Set(missingLot.map(trade => String(trade.symbol).split(':').pop().toUpperCase()))];
+                    const [stRows] = await db.query(
+                        `SELECT tradingsymbol, lot_size FROM script_testing WHERE UPPER(tradingsymbol) IN (${bare.map(() => '?').join(',')})`,
+                        bare
+                    );
+                    stRows.forEach(row => lotBySymbol.set(String(row.tradingsymbol).toUpperCase(), row.lot_size));
+                }
+                hydrated.forEach(trade => {
+                    const bare = String(trade.symbol || '').split(':').pop().toUpperCase();
+                    trade.lot_size = trade.lot_size_at_entry != null
+                        ? trade.lot_size_at_entry
+                        : (lotBySymbol.get(bare) || null);
+                });
+                rows = dedupeTrades(hydrated);
+                if (simpleList) rows = rows.filter(trade => !Number(trade.is_demo));
+            }
         } else {
-            mainQuery = `
-                SELECT t.*,
-                    u.username, u.full_name,
-                    uc.username as created_by_name,
-                    uc.role as created_by_role,
-                    t.lot_size_at_entry AS lot_size
-                FROM trades t
-                LEFT JOIN users u ON t.user_id = u.id
-                LEFT JOIN users uc ON t.created_by = uc.id
-                WHERE ${whereSQL}
-                ORDER BY ${sortCol} ${sortDir}, t.id DESC
-                LIMIT 50
-            `;
+            const [idRows] = await db.query(`SELECT t.id ${idFrom} ORDER BY t.id DESC`, params);
+            const ids = idRows.map(r => Number(r.id)).filter(id => Number.isInteger(id) && id > 0);
+            const CHUNK = 400;
+            for (let i = 0; i < ids.length; i += CHUNK) {
+                const slice = ids.slice(i, i + CHUNK);
+                const [part] = await db.query(
+                    `SELECT t.*,
+                            u.username, u.full_name, u.is_demo,
+                            uc.username AS created_by_name,
+                            uc.role AS created_by_role
+                     FROM trades t
+                     JOIN users u ON t.user_id = u.id
+                     LEFT JOIN users uc ON t.created_by = uc.id
+                     WHERE t.id IN (${slice.join(',')})`
+                );
+                part.forEach(trade => {
+                    if (trade.lot_size == null && trade.lot_size_at_entry != null) {
+                        trade.lot_size = trade.lot_size_at_entry;
+                    }
+                });
+                rows.push(...part);
+            }
+            rows = dedupeTrades(rows);
+            const order = new Map(ids.map((id, idx) => [id, idx]));
+            rows.sort((a, b) => (order.get(Number(a.id)) ?? 0) - (order.get(Number(b.id)) ?? 0));
         }
-
-        const [rows] = await db.execute(mainQuery, params);
-
-        // Total count for paginated responses (uses true database total)
-        let totalTradesCount = trueTotalTrades || rows.length;
-
-
         const commodityLotService = require('../services/CommodityLotService');
         rows.forEach(trade => {
             const info = commodityLotService.getLotInfo(trade.symbol);
@@ -2265,8 +2527,9 @@ const getTrades = async (req, res) => {
         }
 
 
-        // Include Weekly Settlement Items for Closed Trades view (only on first page or unpaginated views)
-        if ((page === 1 || !limit || statusUpper === 'WEEKLY SETTLED') && (statusUpper === 'CLOSED' || !statusUpper || statusUpper === 'WEEKLY SETTLED' || statusUpper === 'SETTLED')) {
+        // Include Weekly Settlement Items for Closed Trades view.
+        // Paginated responses stitch only the settlement rows that belong on this page.
+        if (!paginate && (statusUpper === 'CLOSED' || !statusUpper || statusUpper === 'WEEKLY SETTLED' || statusUpper === 'SETTLED')) {
             try {
                 let wsiQuery = `
                     SELECT wsi.*,
@@ -2307,20 +2570,14 @@ const getTrades = async (req, res) => {
                     }
                 }
 
-                if (req.query.fromDate) {
-                    wsiQuery += ' AND DATE(wsi.created_at) >= ?';
-                    wsiParams.push(req.query.fromDate);
-                } else if (req.query.current_week_only === 'true' || req.query.current_week_only === '1') {
+                const wsiCreated = dayPredicate('wsi.created_at', req.query.fromDate, req.query.toDate);
+                wsiQuery += wsiCreated.sql;
+                wsiParams.push(...wsiCreated.params);
+                if (!req.query.fromDate && req.query.include_history !== 'true' && req.query.include_history !== '1') {
                     const { getWeekBoundaries, getISTDate } = require('../services/WeeklySettlementService');
                     const { week_start } = getWeekBoundaries(getISTDate());
-                    wsiQuery += ` AND wsi.created_at >= '${week_start} 00:00:00'`;
+                    wsiQuery += ` AND wsi.created_at >= COALESCE(u.last_reset_at, '${week_start} 00:00:00')`;
                 }
-                if (req.query.toDate) {
-                    wsiQuery += ' AND DATE(wsi.created_at) <= ?';
-                    wsiParams.push(req.query.toDate);
-                }
-
-                wsiQuery += ' ORDER BY wsi.id DESC LIMIT 50';
 
                 const [wsiRows] = await db.execute(wsiQuery, wsiParams);
                 const wsiMapped = wsiRows.map(item => ({
@@ -2346,25 +2603,74 @@ const getTrades = async (req, res) => {
                 }));
 
                 rows.push(...wsiMapped);
-                totalTradesCount += (wsiMapped?.length || 0);
                 rows.sort((a, b) => new Date(b.exit_time || b.entry_time || b.created_at) - new Date(a.exit_time || a.entry_time || a.created_at));
             } catch (wsiErr) {
                 console.error('[getTrades] Error fetching weekly_settlement_items:', wsiErr);
             }
         }
 
-        // Backward-compatible: return array when no pagination requested
-        try {
-            if (limit && limit > 0) {
-                return res.json({ data: rows, total: totalTradesCount, page, limit });
-            } else {
-                return res.json(rows);
+        if (paginate) {
+            let wsiMapped = [];
+            const wsiIds = (pageKeys || [])
+                .filter(k => String(k.src).trim() === 'W')
+                .map(k => Number(k.row_id))
+                .filter(id => Number.isInteger(id) && id > 0);
+            if (wsiIds.length) {
+                try {
+                    const [wsiRows] = await db.query(
+                        `SELECT wsi.*, u.username, u.full_name
+                         FROM weekly_settlement_items wsi
+                         JOIN users u ON wsi.user_id = u.id
+                         WHERE wsi.id IN (${wsiIds.join(',')})`
+                    );
+                    wsiMapped = wsiRows.map(item => ({
+                        id: `WS-${item.id}`,
+                        trade_id: item.trade_id,
+                        user_id: item.user_id,
+                        username: item.username,
+                        full_name: item.full_name,
+                        symbol: item.symbol,
+                        type: item.type,
+                        qty: item.qty,
+                        lot_size: item.lot_size || 1,
+                        lot_size_at_entry: item.lot_size || 1,
+                        entry_price: parseFloat(item.original_entry_price || 0),
+                        exit_price: parseFloat(item.settlement_price || 0),
+                        pnl: parseFloat(item.settled_pnl || 0),
+                        brokerage: 0,
+                        status: 'WEEKLY SETTLED',
+                        is_weekly_settlement: true,
+                        entry_time: item.created_at,
+                        exit_time: item.created_at,
+                        created_at: item.created_at
+                    }));
+                } catch (wsiErr) {
+                    console.error('[getTrades] Error fetching paged weekly_settlement_items:', wsiErr);
+                }
             }
-        } catch (jsonErr) {
-            console.error('[getTrades] JSON stringify error:', jsonErr.message);
-            const safeSlice = rows.slice(0, 200);
-            return res.json({ data: safeSlice, total: totalTradesCount, page, limit: safeSlice.length, warning: 'Payload truncated for performance' });
+            const tradeById = new Map(rows.map(r => [Number(r.id), r]));
+            const wsiById = new Map(wsiMapped.map(r => [String(r.id), r]));
+            const ordered = [];
+            for (const key of pageKeys || []) {
+                if (String(key.src).trim() === 'T') {
+                    const row = tradeById.get(Number(key.row_id));
+                    if (row) ordered.push(row);
+                } else {
+                    const row = wsiById.get(`WS-${Number(key.row_id)}`);
+                    if (row) ordered.push(row);
+                }
+            }
+            return res.json({
+                data: ordered,
+                total: totalCount,
+                page: pageNum,
+                limit: limitNum,
+                totalPages: Math.max(1, Math.ceil((totalCount || 0) / limitNum))
+            });
         }
+
+        res.json(rows);
+
 
     } catch (err) {
         console.error(err);
@@ -2392,15 +2698,15 @@ const getTradeById = async (req, res) => {
              JOIN users u ON t.user_id = u.id
              LEFT JOIN users uc ON t.created_by = uc.id
              LEFT JOIN script_testing st
-                 ON UPPER(t.symbol) = CONCAT('NFO:', UPPER(st.tradingsymbol))
-                 OR UPPER(t.symbol) = UPPER(st.tradingsymbol)
+                 ON UPPER(t.symbol) COLLATE utf8mb4_unicode_ci = CONCAT('NFO:', UPPER(st.tradingsymbol)) COLLATE utf8mb4_unicode_ci
+                 OR UPPER(t.symbol) COLLATE utf8mb4_unicode_ci = UPPER(st.tradingsymbol) COLLATE utf8mb4_unicode_ci
              LEFT JOIN commodity_forex_crypto_lot_sizes cfl
                  ON UPPER(t.symbol) COLLATE utf8mb4_unicode_ci = UPPER(cfl.symbol) COLLATE utf8mb4_unicode_ci
                  OR UPPER(t.symbol) COLLATE utf8mb4_unicode_ci = CONCAT('COMMODITY:', UPPER(cfl.symbol)) COLLATE utf8mb4_unicode_ci
                  OR UPPER(t.symbol) COLLATE utf8mb4_unicode_ci = CONCAT('FOREX:', UPPER(cfl.symbol)) COLLATE utf8mb4_unicode_ci
                  OR UPPER(t.symbol) COLLATE utf8mb4_unicode_ci = CONCAT('CRYPTO:', UPPER(cfl.symbol)) COLLATE utf8mb4_unicode_ci
                  OR REPLACE(REPLACE(REPLACE(REPLACE(UPPER(t.symbol), 'COMMODITY:', ''), 'FOREX:', ''), 'CRYPTO:', ''), '/', '') COLLATE utf8mb4_unicode_ci = REPLACE(UPPER(cfl.symbol), '/', '') COLLATE utf8mb4_unicode_ci
-             LEFT JOIN scrip_data sd ON t.symbol = sd.symbol
+             LEFT JOIN scrip_data sd ON t.symbol COLLATE utf8mb4_unicode_ci = sd.symbol COLLATE utf8mb4_unicode_ci
              WHERE t.id = ?`,
             [req.params.id]
         );
@@ -2468,11 +2774,14 @@ const getGroupTrades = async (req, res) => {
                 t.type,
                 t.market_type,
                 t.qty,
+                t.actual_qty,
+                t.qty_input,
                 t.entry_price,
                 t.exit_price,
                 t.entry_time,
                 t.exit_time,
                 t.status,
+                t.is_pending,
                 t.created_by,
                 u.username,
                 u.full_name
@@ -2487,7 +2796,7 @@ const getGroupTrades = async (req, res) => {
             query += ` AND t.user_id = ?`;
             params.push(id);
         } else if (role === 'SUPERADMIN') {
-            // Superadmin views all groups
+            console.log('[getGroupTrades] SUPERADMIN viewing all groups');
         } else if (role === 'ADMIN') {
             query += ` AND (t.created_by = ? OR t.user_id IN (
                 SELECT u.id FROM users u 
@@ -2516,21 +2825,20 @@ const getGroupTrades = async (req, res) => {
             params.push(segment);
         }
 
-        // Filter by date range (default to last 7 days if none specified to avoid full table filesort)
-        if (fromDate) {
-            query += ` AND DATE(t.entry_time) >= ?`;
-            params.push(fromDate);
-        } else if (!req.query.all) {
-            query += ` AND t.entry_time >= NOW() - INTERVAL 7 DAY`;
+        const groupDay = dayPredicate('t.entry_time', fromDate, toDate);
+        query += groupDay.sql;
+        params.push(...groupDay.params);
+
+        // No date range means "current week", same window as the closed-trades list.
+        // Scanning the full history here loads every trade into memory.
+        if (!fromDate && !toDate) {
+            const { getWeekBoundaries, getISTDate } = require('../services/WeeklySettlementService');
+            const { week_start } = getWeekBoundaries(getISTDate());
+            query += ' AND t.entry_time >= ?';
+            params.push(`${week_start} 00:00:00`);
         }
 
-        if (toDate) {
-            query += ` AND DATE(t.entry_time) <= ?`;
-            params.push(toDate);
-        }
-
-        // Use indexed t.id DESC with limit to avoid large on-disk temporary tables in C:\xampp\tmp
-        query += ` ORDER BY t.id DESC LIMIT 2000`;
+        query += ` ORDER BY t.symbol ASC, t.type ASC, t.entry_time ASC`;
 
         const [rows] = await db.execute(query, params);
 
@@ -2547,13 +2855,13 @@ const getGroupTrades = async (req, res) => {
         const detectedGroups = [];
         let groupCounter = 1;
 
-        const timeWindowMs = (parseInt(timeWindow, 10) || 30) * 1000;
-        const minUsersCount = parseInt(minUsers, 10) || 2;
+        const timeWindowMs = (parseInt(timeWindow) || 30) * 1000;
+        const minUsersCount = parseInt(minUsers) || 2;
 
         for (const key in groupedByScrip) {
             const trades = groupedByScrip[key];
             // Sort trades by entry_time
-            trades.sort((a, b) => new Date(a.entry_time || 0) - new Date(b.entry_time || 0));
+            trades.sort((a, b) => new Date(a.entry_time) - new Date(b.entry_time));
 
             let currentCluster = [];
             for (const trade of trades) {
@@ -2561,7 +2869,7 @@ const getGroupTrades = async (req, res) => {
                     currentCluster.push(trade);
                 } else {
                     const lastTradeInCluster = currentCluster[currentCluster.length - 1];
-                    const timeDiff = new Date(trade.entry_time || 0) - new Date(lastTradeInCluster.entry_time || 0);
+                    const timeDiff = new Date(trade.entry_time) - new Date(lastTradeInCluster.entry_time);
                     if (timeDiff <= timeWindowMs) {
                         currentCluster.push(trade);
                     } else {
@@ -2578,31 +2886,21 @@ const getGroupTrades = async (req, res) => {
         function processCluster(cluster) {
             const uniqueUsers = [...new Set(cluster.map(t => t.user_id))];
             if (uniqueUsers.length >= minUsersCount) {
-                const entryTimestamps = cluster
-                    .map(t => new Date(t.entry_time || t.created_at || Date.now()).getTime())
-                    .filter(n => !isNaN(n));
-                const minEntryMs = entryTimestamps.length > 0 ? Math.min(...entryTimestamps) : Date.now();
-                const maxEntryMs = entryTimestamps.length > 0 ? Math.max(...entryTimestamps) : Date.now();
-                const firstTradeTime = new Date(minEntryMs);
-                const lastTradeTime = new Date(maxEntryMs);
-
+                const firstTradeTime = new Date(Math.min(...cluster.map(t => new Date(t.entry_time))));
+                const lastTradeTime = new Date(Math.max(...cluster.map(t => new Date(t.entry_time))));
                 const totalQty = cluster.reduce((sum, t) => sum + parseFloat(t.qty || 0), 0);
                 const totalLots = cluster.reduce((sum, t) => sum + parseFloat(t.qty_input != null ? t.qty_input : (t.qty || 0)), 0);
-                const avgPrice = cluster.length > 0
-                    ? cluster.reduce((sum, t) => sum + parseFloat(t.entry_price || 0), 0) / cluster.length
-                    : 0;
+                const avgPrice = cluster.reduce((sum, t) => sum + parseFloat(t.entry_price || 0), 0) / cluster.length;
 
                 // Advanced Coordinated Exit Check:
+                // Check if all users entered within entry window AND exited within exit window
                 let highlyCoordinated = false;
-                const validExitTimes = cluster
-                    .map(t => t.exit_time ? new Date(t.exit_time).getTime() : null)
-                    .filter(t => t !== null && !isNaN(t));
-
-                if (validExitTimes.length === cluster.length && cluster.length > 0) {
-                    const firstExitMs = Math.min(...validExitTimes);
-                    const lastExitMs = Math.max(...validExitTimes);
-                    const exitTimeDifference = Math.round((lastExitMs - firstExitMs) / 1000);
-                    if (exitTimeDifference <= (parseInt(timeWindow, 10) || 30)) {
+                const exitTimes = cluster.map(t => t.exit_time).filter(t => t != null);
+                if (exitTimes.length === cluster.length) {
+                    const firstExitTime = new Date(Math.min(...exitTimes.map(t => new Date(t))));
+                    const lastExitTime = new Date(Math.max(...exitTimes.map(t => new Date(t))));
+                    const exitTimeDifference = Math.round((lastExitTime - firstExitTime) / 1000);
+                    if (exitTimeDifference <= (parseInt(timeWindow) || 30)) {
                         highlyCoordinated = true;
                     }
                 }
@@ -2620,8 +2918,8 @@ const getGroupTrades = async (req, res) => {
                     totalLots,
                     firstTradeTime: firstTradeTime.toISOString(),
                     lastTradeTime: lastTradeTime.toISOString(),
-                    timeDifference: Math.max(0, Math.round((maxEntryMs - minEntryMs) / 1000)),
-                    avgPrice: isNaN(avgPrice) ? '0.00' : avgPrice.toFixed(2),
+                    timeDifference: Math.round((lastTradeTime - firstTradeTime) / 1000),
+                    avgPrice: avgPrice.toFixed(2),
                     highlyCoordinated,
                     trades: cluster
                 });
@@ -2630,8 +2928,8 @@ const getGroupTrades = async (req, res) => {
 
         res.json(detectedGroups);
     } catch (err) {
-        console.error('Get Group Trades Error:', err);
-        res.status(500).json({ message: 'Server Error', error: err.message });
+        console.error(err);
+        res.status(500).send('Server Error');
     }
 };
 
@@ -2697,7 +2995,10 @@ const closeTrade = async (req, res) => {
         const secondsHeld = getTradeAgeInSeconds(trade.entry_time);
         const cleanScripSymbol = trade.symbol.includes(':') ? trade.symbol.split(':')[1] : trade.symbol;
         const [scripRows] = await db.execute('SELECT lot_size FROM scrip_data WHERE symbol = ? OR symbol = ?', [trade.symbol, cleanScripSymbol]);
-        const lotSize = (scripRows.length > 0) ? parseFloat(scripRows[0].lot_size || 1) : 1;
+        const savedLot = parseFloat(trade.lot_size_at_entry);
+        const lotSize = (scripRows.length > 0 && parseFloat(scripRows[0].lot_size) > 0)
+            ? parseFloat(scripRows[0].lot_size)
+            : (savedLot > 0 ? savedLot : 1);
 
         const cleanSymbol = trade.symbol.includes(':') ? trade.symbol.split(':')[1] : trade.symbol;
         const isOptionTrade = cleanSymbol.endsWith('CE') || cleanSymbol.endsWith('PE');
@@ -2762,6 +3063,12 @@ const closeTrade = async (req, res) => {
         }
     } catch (err) {
         console.error('❌ Close Trade Error:', err);
+        if (err.message === 'Trade not found') {
+            return res.status(404).json({ message: 'Trade not found' });
+        }
+        if (err.message === 'Trade is already closed') {
+            return res.status(400).json({ message: 'Trade is already closed' });
+        }
         res.status(500).json({ message: 'Server Error', error: err.message });
     } finally {
         _closingTradesLock.delete(tradeId);
@@ -2834,7 +3141,7 @@ const deleteTrade = async (req, res) => {
             console.log(`[Cache] Clear failed but trade deleted`);
         }
 
-        res.json({ message: 'Trade deleted and refunded', marginRefunded: marginToRefund, pnlRefunded: pnlToRefund });
+        res.json({ message: 'Trade deleted and refunded', pnlRefunded: pnlToReverse });
 
         // Notify user via socket for real-time UI update
         try {
@@ -3360,4 +3667,10 @@ const completePendingOrder = async (req, res) => {
     }
 };
 
-module.exports = { placeOrder, getTrades, getTradeById, getGroupTrades, getActivePositions, closeTrade, deleteTrade, updateTrade, restoreTrade, modifyPendingOrder, setTargetSL, completePendingOrder };
+async function warmTradeListCount() {
+    const financialGen = await getGeneration('financial');
+    const countSql = `SELECT COUNT(*) AS cnt FROM trades t JOIN users u ON u.id = t.user_id AND u.is_demo = 0 WHERE t.status != 'DELETED'`;
+    await cachedCount(financialGen, countSql, []);
+}
+
+module.exports = { placeOrder, getTrades, getTradeById, getGroupTrades, getActivePositions, getActivePositionDetails, closeTrade, deleteTrade, updateTrade, restoreTrade, modifyPendingOrder, setTargetSL, completePendingOrder, warmTradeListCount };

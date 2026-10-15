@@ -38,9 +38,6 @@ class KiteService {
         this.accessToken = null;
         this.sessionData = null;
         this._isAutoLoggingIn = false;
-        this.quoteCache = new Map();
-        this.quoteInFlight = new Map();
-        this.QUOTE_CACHE_TTL_MS = 1000;
 
         // Load existing session if available from DB
         this.loadSession();
@@ -60,8 +57,9 @@ class KiteService {
                     // Check if session is from today in IST (Kite tokens expire at ~6 AM next day IST)
                     const savedDate = getIstDateStr(data.saved_at);
                     const today = getIstDateStr();
+                    const kiteRepo = require('../repositories/KiteRepository');
 
-                    if (savedDate === today) {
+                    if (savedDate === today && kiteRepo.sessionMatchesEnv(data)) {
                         this.accessToken = data.access_token;
                         this.sessionData = {
                             access_token: data.access_token,
@@ -72,10 +70,15 @@ class KiteService {
                         };
                         console.log('📂 Kite session loaded from DB (today\'s IST token)');
                         return true;
-                    } else {
+                    }
+
+                    this.accessToken = null;
+                    this.sessionData = null;
+                    if (savedDate !== today) {
                         console.log('⚠️ Kite session expired in DB (old IST date). Need fresh login.');
-                        this.accessToken = null;
-                        this.sessionData = null;
+                    } else {
+                        const envUser = (process.env.ZERODHA_USER_ID || '').trim() || 'unset';
+                        console.log(`⚠️ Kite session in DB is for ${data.kite_user_id || 'unknown user'} (${data.user_name || 'unknown'}), .env user is ${envUser}. Need fresh login.`);
                     }
                 }
             } else {
@@ -289,35 +292,10 @@ class KiteService {
     }
 
     async getQuote(instruments) {
-        const arr = Array.isArray(instruments) ? [...instruments] : instruments.split(',');
-        arr.sort();
-        const cacheKey = arr.join(',');
-        const now = Date.now();
-
-        const cached = this.quoteCache.get(cacheKey);
-        if (cached && (now - cached.ts) < this.QUOTE_CACHE_TTL_MS) {
-            return cached.result;
-        }
-
-        if (this.quoteInFlight.has(cacheKey)) {
-            return this.quoteInFlight.get(cacheKey);
-        }
-
-        const promise = this._fetchQuote(arr);
-        this.quoteInFlight.set(cacheKey, promise);
-        promise.finally(() => {
-            setTimeout(() => this.quoteInFlight.delete(cacheKey), this.QUOTE_CACHE_TTL_MS);
-        });
-
-        const result = await promise;
-        this.quoteCache.set(cacheKey, { ts: Date.now(), result });
-        return result;
-    }
-
-    async _fetchQuote(arr) {
+        const arr = Array.isArray(instruments) ? instruments : instruments.split(',');
         const queryMap = {};
         const kiteQuery = [];
-
+        
         arr.forEach(i => {
             const mapped = this._mapVirtualToMega(i);
             if (!queryMap[mapped]) queryMap[mapped] = [];
@@ -327,7 +305,7 @@ class KiteService {
 
         const uniqueQuery = [...new Set(kiteQuery)].join('&');
         const data = await this.makeRequest(`/quote?${uniqueQuery}`);
-
+        
         const result = {};
         for (const [mappedSym, val] of Object.entries(data)) {
             if (queryMap[mappedSym]) {
@@ -345,7 +323,7 @@ class KiteService {
         const arr = Array.isArray(instruments) ? instruments : instruments.split(',');
         const queryMap = {};
         const kiteQuery = [];
-
+        
         arr.forEach(i => {
             const mapped = this._mapVirtualToMega(i);
             if (!queryMap[mapped]) queryMap[mapped] = [];
@@ -355,7 +333,7 @@ class KiteService {
 
         const uniqueQuery = [...new Set(kiteQuery)].join('&');
         const data = await this.makeRequest(`/quote/ltp?${uniqueQuery}`);
-
+        
         const result = {};
         for (const [mappedSym, val] of Object.entries(data)) {
             if (queryMap[mappedSym]) {

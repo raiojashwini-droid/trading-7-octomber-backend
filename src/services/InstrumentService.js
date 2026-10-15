@@ -28,7 +28,7 @@ class InstrumentService {
                     try {
                         const repo = require('../repositories/KiteRepository');
                         const latestSession = await repo.getLatestSession();
-                        if (latestSession && latestSession.user_id) {
+                        if (latestSession && latestSession.user_id && repo.sessionMatchesEnv(latestSession)) {
                             await this.syncInstruments(latestSession.user_id);
                         } else {
                             console.error('❌ Auto-sync failed: No active Zerodha session found in DB');

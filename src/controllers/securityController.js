@@ -28,15 +28,31 @@ const getIpClusters = async (req, res) => {
  */
 const getTradeIpAudit = async (req, res) => {
     try {
-        const query = `
+        const indexedQuery = `
             SELECT t.id as trade_id, t.symbol, t.trade_ip, u.username, t.entry_time
-            FROM trades t
+            FROM trades t FORCE INDEX (idx_trades_trade_ip)
             JOIN users u ON t.user_id = u.id
             WHERE t.trade_ip IS NOT NULL
-            ORDER BY t.entry_time DESC
+            ORDER BY t.id DESC
             LIMIT 100
         `;
-        const [rows] = await db.execute(query);
+        try {
+            const [rows] = await db.execute(indexedQuery);
+            return res.json(rows);
+        } catch (err) {
+            if (err.errno !== 1176) throw err;
+        }
+        const [maxRows] = await db.query('SELECT MAX(id) AS maxId FROM trades');
+        const floor = Math.max(0, Number(maxRows[0]?.maxId || 0) - 30000);
+        const [rows] = await db.execute(
+            `SELECT t.id as trade_id, t.symbol, t.trade_ip, u.username, t.entry_time
+             FROM trades t
+             JOIN users u ON t.user_id = u.id
+             WHERE t.id >= ? AND t.trade_ip IS NOT NULL
+             ORDER BY t.id DESC
+             LIMIT 100`,
+            [floor]
+        );
         res.json(rows);
     } catch (err) {
         console.error(err);

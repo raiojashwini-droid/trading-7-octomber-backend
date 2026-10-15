@@ -6,22 +6,8 @@ const { getSegmentExposure } = require('../utils/segmentHelper');
 const { calculateSegmentMargin } = require('../utils/segmentMargin');
 const { getUserBannedScripsStatus } = require('../utils/bannedHelper');
 const { getClientAllowedSegments, isScripSegmentAllowed } = require('../utils/segmentPermissionHelper');
-
-// Shared lot-size cache helper (populated by kiteRoutes or lazily here)
-const LOT_MAP_CACHE_TTL_MS = 10 * 60 * 1000;
-async function getLotMap() {
-    if (global.LOT_MAP_CACHE && (Date.now() - (global.LOT_MAP_CACHE_TIME || 0)) < LOT_MAP_CACHE_TTL_MS) {
-        return global.LOT_MAP_CACHE;
-    }
-    const [lotRows] = await db.execute('SELECT symbol, lot_size FROM scrip_data');
-    const map = {};
-    lotRows.forEach(r => {
-        if (r.symbol) map[r.symbol.toUpperCase()] = parseFloat(r.lot_size || 1);
-    });
-    global.LOT_MAP_CACHE = map;
-    global.LOT_MAP_CACHE_TIME = Date.now();
-    return map;
-}
+const { getExact } = require('../utils/exactResultCache');
+const { getGeneration } = require('../utils/cacheManager');
 
 /**
  * Live Market Prices (Snapshot)
@@ -39,6 +25,57 @@ const getLiveMarket = async (req, res) => {
 const instrumentService = require('../services/InstrumentService');
 const kiteService = require('../utils/kiteService');
 
+const liveM2mFlight = new Map();
+let lotMapCache = { at: 0, map: null };
+
+async function getLotMap() {
+    if (lotMapCache.map && Date.now() - lotMapCache.at < 60000) return lotMapCache.map;
+    const [lotRows] = await db.execute('SELECT symbol, lot_size FROM scrip_data');
+    const map = {};
+    lotRows.forEach(r => {
+        map[String(r.symbol || '').toUpperCase()] = parseFloat(r.lot_size || 1);
+    });
+    lotMapCache = { at: Date.now(), map };
+    return map;
+}
+
+function classifySegment(marketType, symbol) {
+    const mType = (marketType || 'MCX').toUpperCase();
+    let segment = mType === 'EQUITY' ? 'nse' : mType.toLowerCase();
+    if (mType === 'NFO' || mType === 'OPTIONS') {
+        const sym = String(symbol || '').toUpperCase();
+        segment = (sym.endsWith('CE') || sym.endsWith('PE') || /\d{5,}/.test(sym)) ? 'options' : 'nse';
+    }
+    if (segment === 'commodity') segment = 'forex';
+    return segment;
+}
+
+const MCX_NAME_MARKERS = ['GOLD', 'SILVER', 'CRUDEOIL', 'NATURALGAS', 'COPPER', 'ZINC', 'NICKEL', 'LEAD', 'ALUMINIUM'];
+
+function applyWeekGroups(stats, groups, getMultiplier) {
+    for (const group of groups) {
+        const segment = classifySegment(group.market_type, group.symbol);
+        if (stats.buyTurnover[segment] === undefined) continue;
+        const mType = (group.market_type || 'MCX').toUpperCase();
+        const symbol = String(group.symbol || '');
+        const lotSize = getMultiplier(symbol, mType, null);
+        const isMcx = mType === 'MCX' || symbol.toUpperCase().includes('MCX') ||
+            MCX_NAME_MARKERS.some(name => symbol.toUpperCase().includes(name));
+        const qtyValue = parseFloat(group.qty_value || 0);
+        const actualValue = parseFloat(group.actual_value || 0);
+        const fallbackValue = parseFloat(group.fallback_value || 0);
+        const tradeValue = isMcx ? qtyValue * lotSize : (actualValue + fallbackValue * lotSize);
+        if (String(group.type || '').toUpperCase() === 'BUY') stats.buyTurnover[segment] += tradeValue;
+        else stats.sellTurnover[segment] += tradeValue;
+        stats.totalTurnover[segment] += tradeValue;
+        if (!Number(group.carried)) stats.brokerage[segment] += parseFloat(group.brokerage || 0);
+        stats.profitLoss[segment] += parseFloat(group.pnl || 0);
+    }
+}
+
+let lastPriceSyncAt = 0;
+let lastPriceSyncKey = '';
+
 const syncPricesForTrades = async (trades) => {
     try {
         const openSymbols = new Set();
@@ -49,6 +86,8 @@ const syncPricesForTrades = async (trades) => {
         });
 
         if (openSymbols.size === 0) return;
+        const syncKey = [...openSymbols].sort().join('|');
+        if (syncKey === lastPriceSyncKey && Date.now() - lastPriceSyncAt < 5000) return;
 
         const symbolsArr = Array.from(openSymbols);
 
@@ -84,6 +123,8 @@ const syncPricesForTrades = async (trades) => {
                 console.warn('Dashboard getQuote fallback failed:', err.message);
             }
         }
+        lastPriceSyncAt = Date.now();
+        lastPriceSyncKey = syncKey;
     } catch (err) {
         console.error('syncPricesForTrades error:', err);
     }
@@ -95,6 +136,21 @@ const syncPricesForTrades = async (trades) => {
  * Returns: { clients: [], stats: { buyTurnover, sellTurnover, totalTurnover, activeUsers, profitLoss, brokerage } }
  */
 const getClientLiveM2M = async (req, res) => {
+    const flightKey = `${req.user && req.user.id}:${req.query.userId || req.query.id || ''}`;
+    const existing = liveM2mFlight.get(flightKey);
+    if (existing) {
+        try {
+            return res.json(await existing);
+        } catch (err) {
+            console.error('getClientLiveM2M Error:', err);
+            return res.status(500).json({ message: 'Server Error' });
+        }
+    }
+    let finish;
+    const flight = new Promise((resolve, reject) => {
+        finish = { resolve, reject };
+    });
+    liveM2mFlight.set(flightKey, flight);
     try {
         const { id: userId, role } = req.user;
         const filterUserId = req.query.userId || req.query.id;
@@ -113,21 +169,13 @@ const getClientLiveM2M = async (req, res) => {
 
         // 1. Fetch all relevant trades (Non-Deleted)
         let tradeQuery = `
-            SELECT t.*, u.username, u.full_name, u.role as user_role, u.balance, u.is_demo, u.last_reset_at
+            SELECT t.*, u.username, u.full_name, u.role as user_role, u.balance, u.is_demo, u.last_reset_at, cs.config_json as user_config
             FROM trades t
             JOIN users u ON t.user_id = u.id
             LEFT JOIN client_settings cs ON u.id = cs.user_id
             WHERE t.status != 'DELETED'
         `;
         let tradeParams = [];
-
-        // Default time-window to avoid scanning the entire trades table
-        const includeHistory = req.query.include_history === 'true' || req.query.include_history === '1';
-        const days = parseInt(req.query.days, 10) || 7;
-        if (!includeHistory && !req.query.fromDate) {
-            tradeQuery += ' AND t.entry_time >= DATE_SUB(NOW(), INTERVAL ? DAY)';
-            tradeParams.push(days);
-        }
 
         if ((role === 'SUPERADMIN' || role === 'ADMIN') && !filterUserId) {
             isBrokerList = true;
@@ -147,13 +195,8 @@ const getClientLiveM2M = async (req, res) => {
             const brokerIds = brokers.map(b => b.id);
 
             if (role === 'ADMIN') {
-                if (brokerIds.length > 0) {
-                    tradeQuery += ` AND (t.created_by = ? OR t.user_id = ? OR cs.broker_id = ? OR cs.broker_id IN (?) OR t.user_id IN (?))`;
-                    tradeParams.push(userId, userId, userId, brokerIds, brokerIds);
-                } else {
-                    tradeQuery += ` AND (t.created_by = ? OR t.user_id = ? OR cs.broker_id = ?)`;
-                    tradeParams.push(userId, userId, userId);
-                }
+                tradeQuery += ` AND (t.created_by = ? OR t.user_id = ? OR cs.broker_id = ? OR cs.broker_id IN (${brokerIds.length > 0 ? brokerIds.join(',') : '-1'}) OR t.user_id IN (${brokerIds.length > 0 ? brokerIds.join(',') : '-1'}))`;
+                tradeParams.push(userId, userId, userId);
             }
         } else if (filterUserId) {
             if (filterUserRole === 'ADMIN') {
@@ -195,9 +238,78 @@ const getClientLiveM2M = async (req, res) => {
             tradeParams.push(userId);
         }
 
-        const [trades] = await db.execute(tradeQuery, tradeParams);
+        // Live M2M only needs open/hold rows plus the current week for turnover.
+        // All-time closed P/L is aggregated in SQL so historical trades are not
+        // hydrated into Node (that path OOMs around 15 lakh trades).
+        const isSingleTraderRequest = (role === 'TRADER') || (filterUserId && filterUserRole === 'TRADER');
+        const { getWeekBoundaries, getISTDate } = require('../services/WeeklySettlementService');
+        const { week_start } = getWeekBoundaries(getISTDate());
+        const weekStartTs = `${week_start} 00:00:00`;
 
-        // 2. Fetch Multipliers (Lot Sizes) from scrip_data (cached)
+        let closedPlQuery = tradeQuery.replace(
+            /SELECT[\s\S]+?FROM trades t/,
+            'SELECT t.user_id, u.role AS user_role, u.username, u.balance, SUM(IFNULL(t.pnl, 0)) AS closed_pl FROM trades t'
+        );
+        closedPlQuery += ` AND t.status = 'CLOSED'`;
+        if (!isSingleTraderRequest) {
+            closedPlQuery += ' AND IFNULL(u.is_demo, 0) = 0';
+        }
+        closedPlQuery += ' GROUP BY t.user_id, u.role, u.username, u.balance';
+        const closedWhere = closedPlQuery.slice(closedPlQuery.indexOf('WHERE'));
+        if (!closedWhere.includes('cs.')) {
+            closedPlQuery = closedPlQuery.replace(/\s*LEFT JOIN client_settings cs ON u\.id = cs\.user_id/i, '');
+        }
+        const closedPlParams = [...tradeParams];
+
+        // Open rows drive live P/L. This week's turnover is a small grouped
+        // query, cached, instead of loading every closed trade into Node.
+        const openQuery = tradeQuery.replace(
+            /SELECT[\s\S]+?FROM trades t/,
+            `SELECT t.user_id, t.symbol, t.type, t.qty, t.qty_input, t.actual_qty, t.entry_price,
+                    t.market_type, t.status, t.is_pending, t.is_carried_forward, t.last_settlement_price,
+                    t.margin_used, t.brokerage, t.pnl, t.exit_time, t.entry_time, t.trade_mode, t.equity_units_mode,
+                    u.username, u.role AS user_role, u.balance, u.is_demo, u.last_reset_at, cs.config_json AS user_config
+             FROM trades t`
+        ) + ` AND t.status IN ('OPEN', 'HOLD')`;
+
+        const tradeWhere = tradeQuery.slice(tradeQuery.indexOf('WHERE'));
+        let weekQuery = `
+            SELECT t.market_type, t.symbol, t.type, IFNULL(t.is_carried_forward, 0) AS carried,
+                   SUM(ABS(t.qty) * IFNULL(t.entry_price, 0)) AS qty_value,
+                   SUM(CASE WHEN IFNULL(t.actual_qty, 0) > 0 THEN IFNULL(t.entry_price, 0) * t.actual_qty ELSE 0 END) AS actual_value,
+                   SUM(CASE WHEN IFNULL(t.actual_qty, 0) > 0 THEN 0 ELSE ABS(t.qty) * IFNULL(t.entry_price, 0) END) AS fallback_value,
+                   SUM(IFNULL(t.brokerage, 0)) AS brokerage,
+                   SUM(IFNULL(t.pnl, 0)) AS pnl
+            FROM trades t FORCE INDEX (idx_trades_status_exit)
+            JOIN users u ON t.user_id = u.id
+        `;
+        if (tradeWhere.includes('cs.')) {
+            weekQuery += ' LEFT JOIN client_settings cs ON u.id = cs.user_id ';
+        }
+        weekQuery += tradeWhere;
+        weekQuery += ` AND t.status = 'CLOSED' AND t.exit_time >= ? AND COALESCE(t.exit_time, t.entry_time) >= GREATEST(COALESCE(u.last_reset_at, ?), ?)`;
+        if (!isSingleTraderRequest) weekQuery += ' AND IFNULL(u.is_demo, 0) = 0';
+        weekQuery += ' GROUP BY t.market_type, t.symbol, t.type, IFNULL(t.is_carried_forward, 0)';
+        const weekParams = [...tradeParams, weekStartTs, weekStartTs, weekStartTs];
+
+        const financialGen = await getGeneration('financial');
+        const loadRows = (sql, params) => getExact(financialGen, sql + JSON.stringify(params), async () => {
+            const [rows] = await db.execute(sql, params);
+            return rows;
+        });
+        // Cold cache waits for the real aggregate. A warm cache returns the
+        // last exact rows until a trade, ledger, or user write bumps the generation.
+        const [closedPlRows, weekGroups, openRows] = await Promise.all([
+            loadRows(closedPlQuery, closedPlParams),
+            loadRows(weekQuery, weekParams),
+            loadRows(openQuery, tradeParams)
+        ]);
+        const trades = openRows;
+
+        // Price sync hits Kite only for symbols the ticker does not have yet.
+        // Do not hold the dashboard response on that network call.
+        syncPricesForTrades(trades);
+
         const lotMap = await getLotMap();
 
         const { MCX_LOT_SIZES, getMcxBaseScrip } = require('../utils/symbolHelper');
@@ -289,25 +401,19 @@ const getClientLiveM2M = async (req, res) => {
                 };
             });
 
-            // Load hierarchy for brokers/admins only (avoid scanning 1M users)
-            const [adminBrokerUsers] = await db.execute("SELECT id, role, parent_id FROM users WHERE role IN ('SUPERADMIN', 'ADMIN', 'BROKER')");
-            adminBrokerUsers.forEach(u => {
+            // Load hierarchy
+            const [allUsers] = await db.execute("SELECT id, role, parent_id FROM users");
+            allUsers.forEach(u => {
                 userParentMap[u.id] = u.parent_id;
                 userRoleMap[u.id] = u.role;
             });
 
-            // Only fetch client settings/hierarchy for users that actually have trades
-            const tradeUserIdsForHierarchy = [...new Set(trades.map(t => t.user_id).filter(Boolean))];
-            let clientBrokerRows = [];
-            if (tradeUserIdsForHierarchy.length > 0) {
-                const [rows] = await db.query(`
-                    SELECT u.id as client_id, u.parent_id as client_parent_id, cs.broker_id as assigned_broker_id
-                    FROM users u
-                    LEFT JOIN client_settings cs ON u.id = cs.user_id
-                    WHERE u.id IN (?)
-                `, [tradeUserIdsForHierarchy]);
-                clientBrokerRows = rows;
-            }
+            const [clientBrokerRows] = await db.execute(`
+                SELECT u.id as client_id, u.parent_id as client_parent_id, cs.broker_id as assigned_broker_id
+                FROM users u
+                LEFT JOIN client_settings cs ON u.id = cs.user_id
+                WHERE u.role = 'TRADER'
+            `);
 
             clientBrokerRows.forEach(row => {
                 let brokerId = row.assigned_broker_id || row.client_parent_id;
@@ -375,37 +481,73 @@ const getClientLiveM2M = async (req, res) => {
             }
         }
 
-        const isSingleTraderRequest = (role === 'TRADER') || (filterUserId && filterUserRole === 'TRADER');
-
-        // Pre-load user configs and precompute price lookup structures once
-        const tradeUserIds = [...new Set(trades.map(t => t.user_id).filter(Boolean))];
-        let configRows = [];
-        if (tradeUserIds.length > 0) {
-            const [cRows] = await db.query(
-                'SELECT user_id, config_json FROM client_settings WHERE user_id IN (?)',
-                [tradeUserIds]
-            );
-            configRows = cRows;
-        }
-        const configMap = {};
-        configRows.forEach(c => {
-            try { configMap[c.user_id] = JSON.parse(c.config_json || '{}'); } catch (e) { configMap[c.user_id] = {}; }
+        closedPlRows.forEach(row => {
+            const amount = parseFloat(row.closed_pl || 0);
+            const uId = row.user_id;
+            const userRole = row.user_role;
+            if (isBrokerList) {
+                if (userRole === 'ADMIN' || userRole === 'BROKER') {
+                    if (brokerStatsMap[uId]) brokerStatsMap[uId].closedPL += amount;
+                    if (userRole === 'BROKER') {
+                        const parentId = userParentMap[uId];
+                        if (parentId && brokerStatsMap[parentId]) brokerStatsMap[parentId].closedPL += amount;
+                    }
+                } else {
+                    const parents = clientParents[uId];
+                    if (parents) {
+                        if (parents.brokerId && brokerStatsMap[parents.brokerId]) brokerStatsMap[parents.brokerId].closedPL += amount;
+                        if (parents.adminId && brokerStatsMap[parents.adminId]) brokerStatsMap[parents.adminId].closedPL += amount;
+                    }
+                }
+            } else if (userRole === 'TRADER') {
+                if (!clientMap[uId]) {
+                    clientMap[uId] = {
+                        id: uId,
+                        username: row.username,
+                        activePL: 0,
+                        activeTrades: 0,
+                        closedPL: 0,
+                        margin: 0,
+                        marginUsed: 0,
+                        balance: parseFloat(row.balance || 0)
+                    };
+                }
+                clientMap[uId].closedPL = (clientMap[uId].closedPL || 0) + amount;
+            }
         });
 
-        const { getWeekBoundaries, getISTDate } = require('../services/WeeklySettlementService');
-        const { week_start } = getWeekBoundaries(getISTDate());
-        const weekStartTimeMs = new Date(`${week_start} 00:00:00`).getTime();
+        applyWeekGroups(stats, weekGroups, getMultiplier);
 
+        const livePriceCache = new Map();
+        const userConfigCache = new Map();
         const commodityLotService = require('../services/CommodityLotService');
         const { calculateEquityPnL, calculateMcxPnL } = require('../utils/equityPnL');
 
-        const allPrices = marketDataService.prices || {};
-        const priceEntries = Object.entries(allPrices).map(([key, price]) => {
-            const hasPrefix = key.includes(':');
-            const prefix = hasPrefix ? key.split(':')[0].toUpperCase() : '';
-            const clean = hasPrefix ? key.split(':')[1].toUpperCase() : key.toUpperCase();
-            return { key, prefix, clean, price };
-        });
+        const resolveLivePrice = (trade, mType) => {
+            const cacheKey = `${mType}|${trade.symbol}`;
+            if (livePriceCache.has(cacheKey)) return livePriceCache.get(cacheKey);
+            const cleanSymbol = trade.symbol.includes(':') ? trade.symbol.split(':')[1] : trade.symbol;
+            const PREFIX_MAP = { MCX: 'MCX', NSE: 'NSE', NFO: 'NFO', EQUITY: 'NSE', OPTIONS: 'NFO', NIFTY: 'NFO' };
+            const prefix = PREFIX_MAP[mType] || mType;
+            const searchPatterns = [
+                trade.symbol,
+                `${prefix}:${cleanSymbol}`,
+                cleanSymbol,
+                cleanSymbol.replace(/FUT$/i, ''),
+                `${prefix}:${cleanSymbol.replace(/FUT$/i, '')}`,
+                `NSE:${cleanSymbol}`,
+                `NFO:${cleanSymbol}`,
+                `MCX:${cleanSymbol}`
+            ];
+            let liveData = null;
+            for (const pattern of searchPatterns) {
+                liveData = marketDataService.getPrice(pattern);
+                if (liveData) break;
+            }
+            // Same contract only. An expired GOLD26OCT quote must not use GOLD26DEC.
+            livePriceCache.set(cacheKey, liveData);
+            return liveData;
+        };
 
         trades.forEach(trade => {
             // Exclude demo trades for global aggregations / broker dashboards
@@ -434,8 +576,20 @@ const getClientLiveM2M = async (req, res) => {
             const qty = Math.abs(trade.qty);
             const entryPrice = parseFloat(trade.entry_price || 0);
 
-            // Use pre-loaded user config
-            const userConfig = configMap[trade.user_id] || null;
+            // Parse user config if available
+            let userConfig = null;
+            if (userConfigCache.has(trade.user_id)) {
+                userConfig = userConfigCache.get(trade.user_id);
+            } else if (trade.user_config) {
+                try {
+                    userConfig = typeof trade.user_config === 'string' ? JSON.parse(trade.user_config) : trade.user_config;
+                } catch (e) {
+                    console.error('Failed to parse user config for P/L calculation:', e);
+                }
+                userConfigCache.set(trade.user_id, userConfig);
+            } else {
+                userConfigCache.set(trade.user_id, null);
+            }
 
             const lotSize = getMultiplier(trade.symbol, mType, userConfig);
 
@@ -454,8 +608,12 @@ const getClientLiveM2M = async (req, res) => {
             const tradeValue = entryPrice * totalUnits;
 
             // Scope Dashboard Turnover and Brokerage stats to Current Active Week / Last Reset Cycle (Full Timestamp Comparison)
+            const { getWeekBoundaries, getISTDate } = require('../services/WeeklySettlementService');
+            const { week_start } = getWeekBoundaries(getISTDate());
+
             const tradeTimeMs = trade.exit_time ? new Date(trade.exit_time).getTime() : (trade.entry_time ? new Date(trade.entry_time).getTime() : 0);
-            const resetTimeMs = trade.last_reset_at ? new Date(trade.last_reset_at).getTime() : weekStartTimeMs;
+            const resetTimeMs = trade.last_reset_at ? new Date(trade.last_reset_at).getTime() : new Date(`${week_start} 00:00:00`).getTime();
+            const weekStartTimeMs = new Date(`${week_start} 00:00:00`).getTime();
 
             const effectiveResetMs = Math.max(resetTimeMs, weekStartTimeMs);
             const isTradeInCurrentWeek = tradeTimeMs >= effectiveResetMs;
@@ -476,40 +634,8 @@ const getClientLiveM2M = async (req, res) => {
                 if (isTradeInCurrentWeek) {
                     stats.profitLoss[segment] += rawClosedPnl;
                 }
-
-                if (isBrokerList) {
-                    if (trade.user_role === 'ADMIN' || trade.user_role === 'BROKER') {
-                        const uId = trade.user_id;
-                        if (brokerStatsMap[uId]) {
-                            brokerStatsMap[uId].closedPL += rawClosedPnl;
-                        }
-                        if (trade.user_role === 'BROKER') {
-                            const parentId = userParentMap[uId];
-                            if (parentId && brokerStatsMap[parentId]) {
-                                brokerStatsMap[parentId].closedPL += rawClosedPnl;
-                            }
-                        }
-                    } else {
-                        const parents = clientParents[trade.user_id];
-                        if (parents) {
-                            const { brokerId, adminId } = parents;
-                            if (brokerId && brokerStatsMap[brokerId]) {
-                                brokerStatsMap[brokerId].closedPL += rawClosedPnl;
-                            }
-                            if (adminId && brokerStatsMap[adminId]) {
-                                brokerStatsMap[adminId].closedPL += rawClosedPnl;
-                            }
-                        }
-                    }
-                } else if (trade.user_role === 'TRADER') {
-                    if (!clientMap[trade.user_id]) {
-                        clientMap[trade.user_id] = {
-                            id: trade.user_id, username: trade.username,
-                            activePL: 0, activeTrades: 0, closedPL: 0, margin: 0, marginUsed: 0, balance: parseFloat(trade.balance || 0)
-                        };
-                    }
-                    clientMap[trade.user_id].closedPL += rawClosedPnl;
-                }
+                // All-time closedPL is applied from closedPlRows above.
+                // This loop only sees the current week, so it must not add closedPL again.
             }
 
             if ((trade.status === 'OPEN' || trade.status === 'HOLD') && !trade.is_pending) {
@@ -517,48 +643,7 @@ const getClientLiveM2M = async (req, res) => {
                 if (isBuy) stats.activeBuy[segment] += 1;
                 else stats.activeSell[segment] += 1;
 
-                // 🎯 Try multiple symbol patterns to find the live price in the ticker
-                const cleanSymbol = trade.symbol.includes(':') ? trade.symbol.split(':')[1] : trade.symbol;
-                const PREFIX_MAP = { MCX: 'MCX', NSE: 'NSE', NFO: 'NFO', EQUITY: 'NSE', OPTIONS: 'NFO', NIFTY: 'NFO' };
-                const prefix = PREFIX_MAP[mType] || mType;
-                const searchPatterns = [
-                    trade.symbol,
-                    `${prefix}:${cleanSymbol}`,
-                    cleanSymbol,
-                    cleanSymbol.replace(/FUT$/i, ''),
-                    `${prefix}:${cleanSymbol.replace(/FUT$/i, '')}`,
-                    `NSE:${cleanSymbol}`,
-                    `NFO:${cleanSymbol}`,
-                    `MCX:${cleanSymbol}`
-                ];
-
-                let liveData = null;
-                for (const pattern of searchPatterns) {
-                    liveData = marketDataService.getPrice(pattern);
-                    if (liveData) break;
-                }
-
-                // 🔍 Fuzzy match fallback by base symbol prefix (uses precomputed priceEntries)
-                if (!liveData) {
-                    const baseSym = cleanSymbol.toUpperCase().replace(/\d+.*/, '');
-                    if (baseSym && baseSym.length >= 3) {
-                        const prefixUpper = prefix.toUpperCase();
-                        for (const entry of priceEntries) {
-                            if (entry.clean.startsWith(baseSym) && (!prefixUpper || entry.prefix === prefixUpper)) {
-                                liveData = entry.price;
-                                break;
-                            }
-                        }
-                        if (!liveData) {
-                            for (const entry of priceEntries) {
-                                if (entry.clean.startsWith(baseSym)) {
-                                    liveData = entry.price;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
+                const liveData = resolveLivePrice(trade, mType);
 
                 const baselinePrice = (trade.is_carried_forward || trade.status === 'HOLD') && trade.last_settlement_price !== null && trade.last_settlement_price !== undefined
                     ? parseFloat(trade.last_settlement_price)
@@ -681,21 +766,34 @@ const getClientLiveM2M = async (req, res) => {
                             clientMap[trade.user_id].positions[sym] = {
                                 symbol: sym,
                                 buyQty: 0, sellQty: 0, buyTotal: 0, sellTotal: 0,
+                                buyShareValue: 0, sellShareValue: 0, buyShares: 0, sellShares: 0,
                                 actualBuyQty: 0, actualSellQty: 0,
                                 pnl: 0, margin: 0, marginUsed: 0, cmp: exitPrice,
                                 type: trade.type, avgPrice: 0
                             };
                         }
                         const p = clientMap[trade.user_id].positions[sym];
+                        // NSE stores shares in qty for both lots and qty mode.
+                        // The number outside the bracket is qty_input (lots, or shares in qty mode).
+                        const parsedInput = parseFloat(trade.qty_input);
+                        const displayLots = (!Number.isNaN(parsedInput) && parsedInput !== 0)
+                            ? Math.abs(parsedInput)
+                            : qty;
+                        const parsedActual = parseFloat(trade.actual_qty);
+                        const shareQty = (!Number.isNaN(parsedActual) && parsedActual > 0)
+                            ? Math.abs(parsedActual)
+                            : qty;
                         if (isBuy) {
-                            p.buyQty += qty;
-                            p.buyTotal += entryPrice * qty;
-                            p.actualBuyQty += parseFloat(trade.actual_qty || 0);
+                            p.buyQty += displayLots;
+                            p.buyShareValue += entryPrice * shareQty;
+                            p.buyShares += shareQty;
+                            p.actualBuyQty += (!Number.isNaN(parsedActual) ? Math.abs(parsedActual) : 0);
                         }
                         else {
-                            p.sellQty += qty;
-                            p.sellTotal += entryPrice * qty;
-                            p.actualSellQty += parseFloat(trade.actual_qty || 0);
+                            p.sellQty += displayLots;
+                            p.sellShareValue += entryPrice * shareQty;
+                            p.sellShares += shareQty;
+                            p.actualSellQty += (!Number.isNaN(parsedActual) ? Math.abs(parsedActual) : 0);
                         }
                         p.pnl += unrealizedPnl;
                         p.margin += dynamicMargin;
@@ -736,11 +834,18 @@ const getClientLiveM2M = async (req, res) => {
             if (c.positions) {
                 positions = Object.values(c.positions).map(p => {
                     const netQty = p.buyQty - p.sellQty;
-                    const avgPrice = netQty > 0 ? (p.buyTotal / p.buyQty) : (netQty < 0 ? (p.sellTotal / p.sellQty) : 0);
+                    const buyAvg = p.buyShares > 0 ? (p.buyShareValue / p.buyShares) : 0;
+                    const sellAvg = p.sellShares > 0 ? (p.sellShareValue / p.sellShares) : 0;
+                    // Keep buyTotal / buyQty equal to the share average so the page rate stays the trade price.
+                    p.buyTotal = buyAvg * p.buyQty;
+                    p.sellTotal = sellAvg * p.sellQty;
+                    const netShares = p.buyShares - p.sellShares;
+                    const avgPrice = netShares > 0 ? buyAvg : (netShares < 0 ? sellAvg : 0);
                     const isCryptoForex = p.symbol.startsWith('CRYPTO:') || p.symbol.startsWith('FOREX:');
                     const decimals = isCryptoForex ? 4 : 2;
+                    const { buyShareValue, sellShareValue, buyShares, sellShares, ...position } = p;
                     return {
-                        ...p,
+                        ...position,
                         netQty,
                         avgPrice: avgPrice.toFixed(decimals),
                         pnl: p.pnl.toFixed(decimals),
@@ -775,12 +880,14 @@ const getClientLiveM2M = async (req, res) => {
                         marginUsed: b.marginUsed.toFixed(2)
                     };
                 });
-            return res.json({
+            const brokerPayload = {
                 isBrokerList: true,
                 isBroker: true,
                 clients: formattedBrokers,
                 stats: finalizedStats
-            });
+            };
+            finish.resolve(brokerPayload);
+            return res.json(brokerPayload);
         }
 
         let resultClients = formattedClients;
@@ -788,15 +895,20 @@ const getClientLiveM2M = async (req, res) => {
             resultClients = formattedClients.filter(c => (c.activeTrades || 0) > 0);
         }
 
-        res.json({
+        const clientPayload = {
             isBroker: (filterUserRole === 'BROKER' || filterUserRole === 'ADMIN'),
             clients: resultClients,
             stats: finalizedStats
-        });
+        };
+        finish.resolve(clientPayload);
+        res.json(clientPayload);
 
     } catch (err) {
         console.error('getClientLiveM2M Error:', err);
-        res.status(500).send('Server Error');
+        if (finish) finish.reject(err);
+        if (!res.headersSent) res.status(500).send('Server Error');
+    } finally {
+        if (liveM2mFlight.get(flightKey) === flight) liveM2mFlight.delete(flightKey);
     }
 };
 
@@ -907,7 +1019,11 @@ const getIndices = async (req, res) => {
 const getWatchlist = async (req, res) => {
     try {
         const { hideSet, markSet } = await getUserBannedScripsStatus(req.user?.id, req.user?.role);
-        const lotMap = await getLotMap();
+        const [lotRows] = await db.execute('SELECT symbol, lot_size FROM scrip_data');
+        const lotMap = {};
+        lotRows.forEach(r => {
+            lotMap[r.symbol.toUpperCase()] = parseFloat(r.lot_size || 1);
+        });
 
         function isHidden(sym) {
             if (!sym || hideSet.size === 0) return false;
