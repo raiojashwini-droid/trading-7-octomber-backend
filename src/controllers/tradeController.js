@@ -2,7 +2,7 @@ const db = require('../config/db');
 const { logAction } = require('./systemController');
 const mockEngine = require('../utils/mockEngine');
 const bcrypt = require('bcryptjs');
-const { invalidateCache, getGeneration } = require('../utils/cacheManager');
+const { invalidateCache, getGeneration, getFromCache, saveToCache } = require('../utils/cacheManager');
 const { getExact } = require('../utils/exactResultCache');
 const { isCalendarDay, startOfDay, nextDayStart } = require('../utils/dateRange');
 const { getMcxBaseScrip, getLotSize } = require('../utils/symbolHelper');
@@ -14,9 +14,17 @@ const { isScripBannedForUser } = require('../utils/bannedHelper');
 const { extractClientIp } = require('../utils/ipHelper');
 
 async function cachedCount(gen, sql, params = []) {
+    const redisKey = `count_${gen}_${Buffer.from(sql + JSON.stringify(params)).toString('base64').slice(0, 80)}`;
+    try {
+        const cached = await getFromCache(redisKey);
+        if (cached !== null && cached !== undefined) return Number(cached);
+    } catch (_) {}
+
     return getExact(gen, `count\n${sql}\n${JSON.stringify(params)}`, async () => {
         const [rows] = await db.query(sql, params);
-        return Number(rows[0]?.cnt || 0);
+        const val = Number(rows[0]?.cnt || 0);
+        try { await saveToCache(redisKey, val, 300); } catch (_) {}
+        return val;
     });
 }
 
@@ -2256,15 +2264,18 @@ const getTrades = async (req, res) => {
                 && req.user.role === 'SUPERADMIN';
             if (fullHistory) {
                 const countSql = (simpleList && statusUpperEarly !== 'DELETED')
-                    ? `SELECT COUNT(*) AS cnt FROM trades t JOIN users u ON u.id = t.user_id AND u.is_demo = 0 WHERE t.status != 'DELETED'`
+                    ? `SELECT COUNT(*) AS cnt FROM trades WHERE status != 'DELETED'`
                     : `SELECT COUNT(*) AS cnt ${idFrom}`;
                 const countParams = (simpleList && statusUpperEarly !== 'DELETED') ? [] : params;
-                const pageFrom = `FROM trades t FORCE INDEX (PRIMARY) JOIN users u ON t.user_id = u.id ${whereClause}`;
+                const pageFrom = (simpleList && statusUpperEarly !== 'DELETED')
+                    ? `FROM trades t USE INDEX (idx_trades_status_id) WHERE t.status != 'DELETED'`
+                    : `FROM trades t USE INDEX (idx_trades_status_id, PRIMARY) JOIN users u ON t.user_id = u.id ${whereClause}`;
+                const pageParams = (simpleList && statusUpperEarly !== 'DELETED') ? [] : params;
                 const [countValue, keyRows] = await Promise.all([
                     cachedCount(financialGen, countSql, countParams),
                     db.query(
                         `SELECT 'T' AS src, t.id AS row_id ${pageFrom} ORDER BY t.id DESC LIMIT ${limitNum} OFFSET ${offset}`,
-                        params
+                        pageParams
                     ).then(([rows]) => rows)
                 ]);
                 totalCount = countValue;
