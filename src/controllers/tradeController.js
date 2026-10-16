@@ -2265,12 +2265,16 @@ const getTrades = async (req, res) => {
             if (fullHistory) {
                 const countSql = (simpleList && statusUpperEarly !== 'DELETED')
                     ? `SELECT COUNT(*) AS cnt FROM trades WHERE status != 'DELETED'`
-                    : `SELECT COUNT(*) AS cnt ${idFrom}`;
-                const countParams = (simpleList && statusUpperEarly !== 'DELETED') ? [] : params;
+                    : (simpleList && statusUpperEarly === 'DELETED')
+                        ? `SELECT COUNT(*) AS cnt FROM trades WHERE status = 'DELETED'`
+                        : `SELECT COUNT(*) AS cnt ${idFrom}`;
+                const countParams = simpleList ? [] : params;
                 const pageFrom = (simpleList && statusUpperEarly !== 'DELETED')
                     ? `FROM trades t USE INDEX (idx_trades_status_id) WHERE t.status != 'DELETED'`
-                    : `FROM trades t USE INDEX (idx_trades_status_id, PRIMARY) JOIN users u ON t.user_id = u.id ${whereClause}`;
-                const pageParams = (simpleList && statusUpperEarly !== 'DELETED') ? [] : params;
+                    : (simpleList && statusUpperEarly === 'DELETED')
+                        ? `FROM trades t USE INDEX (idx_trades_status_id) WHERE t.status = 'DELETED'`
+                        : `FROM trades t USE INDEX (idx_trades_status_id, PRIMARY) JOIN users u ON t.user_id = u.id ${whereClause}`;
+                const pageParams = simpleList ? [] : params;
                 const [countValue, keyRows] = await Promise.all([
                     cachedCount(financialGen, countSql, countParams),
                     db.query(
@@ -2766,6 +2770,13 @@ const getGroupTrades = async (req, res) => {
         const { id, role } = req.user;
         const { scrip, segment, fromDate, toDate, timeWindow = 30, minUsers = 2 } = req.query;
 
+        const financialGen = await getGeneration('financial');
+        const redisKey = `group_trades_${financialGen}_${role}_${id}_${Buffer.from(JSON.stringify(req.query)).toString('base64').slice(0, 60)}`;
+        try {
+            const cached = await getFromCache(redisKey);
+            if (cached) return res.json(typeof cached === 'string' ? JSON.parse(cached) : cached);
+        } catch (_) {}
+
         let query = `
             SELECT
                 t.id,
@@ -2926,6 +2937,7 @@ const getGroupTrades = async (req, res) => {
             }
         }
 
+        try { await saveToCache(redisKey, detectedGroups, 120); } catch (_) {}
         res.json(detectedGroups);
     } catch (err) {
         console.error(err);
